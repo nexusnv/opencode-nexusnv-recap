@@ -34,7 +34,7 @@ function fakeContext(options: { text?: FakeText; experimental?: unknown } = {}):
       return text(input, request)
     },
   }
-  const experimental = options.experimental ?? { terminal: {} }
+  const experimental = "experimental" in options ? options.experimental : { terminal: {} }
   return { ctx: { generate, experimental } as unknown as ModelContext, calls }
 }
 
@@ -53,6 +53,10 @@ function makeConfig(limits: Partial<LimitsConfig> = {}, model: TimelineModelRef 
 
 function httpError(status: number, message = `HTTP ${status}`): Error & { status: number } {
   return Object.assign(new Error(message), { status })
+}
+
+function taggedError(tag: string, props: Record<string, unknown> = {}, message = tag): Error {
+  return Object.assign(new Error(message), { _tag: tag, ...props })
 }
 
 interface SleepRecorder {
@@ -154,6 +158,24 @@ describe("createModelClient", () => {
 
     expect(await client.complete("p")).toBe("{}")
     expect(harness.calls).toHaveLength(1)
+  })
+
+  test("falls back to ctx.generate.text when experimental is undefined", async () => {
+    const harness = fakeContext({ experimental: undefined })
+    const client = createModelClient(harness.ctx, makeConfig())
+
+    expect(await client.complete("p")).toBe("{}")
+    expect(harness.calls).toHaveLength(1)
+  })
+
+  test("falls back to ctx.generate.text when experimental.generate is not a usable object", async () => {
+    for (const experimental of [{ generate: {} }, { generate: 42 }, { generate: null }, 42, null]) {
+      const harness = fakeContext({ experimental })
+      const client = createModelClient(harness.ctx, makeConfig())
+
+      expect(await client.complete("p")).toBe("{}")
+      expect(harness.calls).toHaveLength(1)
+    }
   })
 
   test("returns result.text verbatim", async () => {
@@ -272,6 +294,269 @@ describe("createModelClient", () => {
       expect(harness.calls).toHaveLength(2)
       expect(recorder.delays).toEqual([500])
     }
+  })
+
+  test("classifies host-tagged service and RPC errors as transient and retries them", async () => {
+    for (const tag of ["ServiceUnavailableError", "RpcInternalError", "UnknownError"]) {
+      const harness = fakeContext({
+        text: async () => {
+          throw taggedError(tag, {}, "host failure")
+        },
+      })
+      const recorder = sleepRecorder()
+      const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+      const failure = await failureOf(client.complete("p"))
+
+      expect(failure.kind).toBe("transient")
+      expect(failure.retryable).toBe(true)
+      expect(failure.status).toBeUndefined()
+      expect(harness.calls).toHaveLength(2)
+      expect(recorder.delays).toEqual([500])
+    }
+  })
+
+  test("classifies host-tagged auth and location errors as non-retryable", async () => {
+    const cases = [
+      ["UnauthorizedError", "auth"],
+      ["ForbiddenError", "auth"],
+      ["LocationNotFoundError", "config"],
+      ["ProviderNotFoundError", "config"],
+    ] as const
+
+    for (const [tag, kind] of cases) {
+      const harness = fakeContext({
+        text: async () => {
+          throw taggedError(tag, {}, "host rejected the request")
+        },
+      })
+      const recorder = sleepRecorder()
+      const client = createModelClient(harness.ctx, makeConfig({ retries: 2 }), recorder.options)
+      const failure = await failureOf(client.complete("p"))
+
+      expect(failure.kind).toBe(kind)
+      expect(failure.retryable).toBe(false)
+      expect(harness.calls).toHaveLength(1)
+      expect(recorder.delays).toEqual([])
+    }
+  })
+
+  test("classifies InvalidRequestError as model unless it signals a transient condition", async () => {
+    const modelHarness = fakeContext({
+      text: async () => {
+        throw taggedError("InvalidRequestError", {}, "invalid prompt")
+      },
+    })
+    const modelRecorder = sleepRecorder()
+    const modelClient = createModelClient(modelHarness.ctx, makeConfig({ retries: 2 }), modelRecorder.options)
+    const modelFailure = await failureOf(modelClient.complete("p"))
+
+    expect(modelFailure.kind).toBe("model")
+    expect(modelFailure.retryable).toBe(false)
+    expect(modelHarness.calls).toHaveLength(1)
+    expect(modelRecorder.delays).toEqual([])
+
+    for (const props of [{ kind: "rate_limit" }, { kind: "overloaded" }, { message: "rate limit exceeded" }]) {
+      const harness = fakeContext({
+        text: async () => {
+          throw taggedError("InvalidRequestError", props, "invalid prompt")
+        },
+      })
+      const recorder = sleepRecorder()
+      const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+      const failure = await failureOf(client.complete("p"))
+
+      expect(failure.kind).toBe("transient")
+      expect(failure.retryable).toBe(true)
+      expect(harness.calls).toHaveLength(2)
+      expect(recorder.delays).toEqual([500])
+    }
+  })
+
+  test("classifies ClientError transport and oversized-stream reasons as transient", async () => {
+    for (const reason of ["Transport", "SseEventTooLarge"]) {
+      const harness = fakeContext({
+        text: async () => {
+          throw Object.assign(new Error(`${reason}: boom`), {
+            _tag: "ClientError",
+            reason,
+            cause: new TypeError("fetch failed"),
+          })
+        },
+      })
+      const recorder = sleepRecorder()
+      const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+      const failure = await failureOf(client.complete("p"))
+
+      expect(failure.kind).toBe("transient")
+      expect(failure.retryable).toBe(true)
+      expect(harness.calls).toHaveLength(2)
+      expect(recorder.delays).toEqual([500])
+    }
+  })
+
+  test("classifies ClientError UnexpectedStatus by its nested status", async () => {
+    const harness = fakeContext({
+      text: async () => {
+        throw Object.assign(new Error("UnexpectedStatus: 429"), {
+          name: "ClientError",
+          reason: "UnexpectedStatus",
+          cause: { status: 429 },
+        })
+      },
+    })
+    const recorder = sleepRecorder()
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+    const failure = await failureOf(client.complete("p"))
+
+    expect(failure.kind).toBe("transient")
+    expect(failure.retryable).toBe(true)
+    expect(failure.status).toBe(429)
+    expect(harness.calls).toHaveLength(2)
+    expect(recorder.delays).toEqual([500])
+  })
+
+  test("classifies malformed ClientError responses as non-retryable model failures", async () => {
+    for (const reason of ["MalformedResponse", "UnsupportedContentType"]) {
+      const harness = fakeContext({
+        text: async () => {
+          throw Object.assign(new Error(`${reason}`), { _tag: "ClientError", reason })
+        },
+      })
+      const failure = await failureOf(createModelClient(harness.ctx, makeConfig({ retries: 2 })).complete("p"))
+
+      expect(failure.kind).toBe("model")
+      expect(failure.retryable).toBe(false)
+      expect(harness.calls).toHaveLength(1)
+    }
+  })
+
+  test("classifies effect-style ClientError defects as transient", async () => {
+    const harness = fakeContext({
+      text: async () => {
+        throw taggedError("ClientError", { cause: new TypeError("socket hang up") })
+      },
+    })
+    const recorder = sleepRecorder()
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+    const failure = await failureOf(client.complete("p"))
+
+    expect(failure.kind).toBe("transient")
+    expect(failure.retryable).toBe(true)
+    expect(harness.calls).toHaveLength(2)
+    expect(recorder.delays).toEqual([500])
+  })
+
+  test("classifies auth from statuses nested in a cause", async () => {
+    for (const status of [401, 403]) {
+      const harness = fakeContext({
+        text: async () => {
+          throw Object.assign(new Error(`HTTP ${status}`), { cause: { status } })
+        },
+      })
+      const failure = await failureOf(createModelClient(harness.ctx, makeConfig({ retries: 2 })).complete("p"))
+
+      expect(failure.kind).toBe("auth")
+      expect(failure.retryable).toBe(false)
+      expect(failure.status).toBe(status)
+      expect(harness.calls).toHaveLength(1)
+    }
+  })
+
+  test("ignores status 0 and classifies a coded network failure as transient", async () => {
+    const harness = fakeContext({
+      text: async () => {
+        throw Object.assign(new Error("connection reset"), { status: 0, code: "ECONNRESET" })
+      },
+    })
+    const recorder = sleepRecorder()
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+    const failure = await failureOf(client.complete("p"))
+
+    expect(failure.kind).toBe("transient")
+    expect(failure.retryable).toBe(true)
+    expect(failure.status).toBeUndefined()
+    expect(harness.calls).toHaveLength(2)
+    expect(recorder.delays).toEqual([500])
+  })
+
+  test("classifies status-less connection, DNS, and timeout failures as transient", async () => {
+    const errors = [
+      Object.assign(new Error("connection aborted"), { code: "ECONNABORTED" }),
+      Object.assign(new Error("host not found"), { code: "ENOTFOUND" }),
+      new Error("request timed out"),
+      new Error("service unavailable"),
+    ]
+
+    for (const error of errors) {
+      const harness = fakeContext({
+        text: async () => {
+          throw error
+        },
+      })
+      const recorder = sleepRecorder()
+      const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+      const failure = await failureOf(client.complete("p"))
+
+      expect(failure.kind).toBe("transient")
+      expect(failure.retryable).toBe(true)
+      expect(harness.calls).toHaveLength(2)
+      expect(recorder.delays).toEqual([500])
+    }
+  })
+
+  test("extracts status from statusCode, data, response, and nested causes", async () => {
+    const cases = [
+      { error: Object.assign(new Error("statusCode"), { statusCode: 503 }), status: 503 },
+      { error: Object.assign(new Error("data"), { data: { status: 429 } }), status: 429 },
+      { error: Object.assign(new Error("response"), { response: { status: 503 } }), status: 503 },
+      { error: Object.assign(new Error("nested"), { cause: { response: { status: 503 } } }), status: 503 },
+    ]
+
+    for (const item of cases) {
+      const harness = fakeContext({
+        text: async () => {
+          throw item.error
+        },
+      })
+      const recorder = sleepRecorder()
+      const client = createModelClient(harness.ctx, makeConfig({ retries: 1 }), recorder.options)
+      const failure = await failureOf(client.complete("p"))
+
+      expect(failure.kind).toBe("transient")
+      expect(failure.status).toBe(item.status)
+      expect(harness.calls).toHaveLength(2)
+      expect(recorder.delays).toEqual([500])
+    }
+  })
+
+  test("makes a single call when retries is 0", async () => {
+    const harness = fakeContext({
+      text: async () => {
+        throw httpError(503)
+      },
+    })
+    const recorder = sleepRecorder()
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 0 }), recorder.options)
+    const failure = await failureOf(client.complete("p"))
+
+    expect(failure.kind).toBe("transient")
+    expect(harness.calls).toHaveLength(1)
+    expect(recorder.delays).toEqual([])
+  })
+
+  test("caps exponential backoff at five seconds", async () => {
+    const harness = fakeContext({
+      text: async () => {
+        throw httpError(503)
+      },
+    })
+    const recorder = sleepRecorder(() => 0.5)
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 6 }), recorder.options)
+    const failure = await failureOf(client.complete("p"))
+
+    expect(failure.kind).toBe("transient")
+    expect(harness.calls).toHaveLength(7)
+    expect(recorder.delays).toEqual([625, 1_125, 2_125, 4_125, 5_000, 5_000])
   })
 
   test("classifies 400 as a non-retryable model failure", async () => {
@@ -422,6 +707,83 @@ describe("createModelClient", () => {
     expect(failure.kind).toBe("aborted")
     expect(failure.retryable).toBe(false)
     expect(harness.calls).toHaveLength(1)
+  })
+
+  test("rejects promptly when the host ignores the external abort signal", async () => {
+    const controller = new AbortController()
+    const harness = fakeContext({
+      text: () => new Promise(() => {}),
+    })
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 2, modelTimeoutMs: 10_000 }))
+    const started = performance.now()
+
+    const pending = client.complete("p", controller.signal)
+    expect(harness.calls).toHaveLength(1)
+    controller.abort()
+    const failure = await failureOf(pending)
+
+    expect(failure.kind).toBe("aborted")
+    expect(failure.retryable).toBe(false)
+    expect(harness.calls).toHaveLength(1)
+    expect(performance.now() - started).toBeLessThan(1_000)
+  })
+
+  test("ignores a host success that arrives after the caller aborts", async () => {
+    const controller = new AbortController()
+    const harness = fakeContext({
+      text: (_input, options) =>
+        new Promise((resolve) => {
+          options?.signal?.addEventListener("abort", () => resolve({ text: "late" }), { once: true })
+        }),
+    })
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 2, modelTimeoutMs: 10_000 }))
+
+    const pending = client.complete("p", controller.signal)
+    controller.abort()
+    const failure = await failureOf(pending)
+
+    expect(failure.kind).toBe("aborted")
+    expect(failure.retryable).toBe(false)
+    expect(harness.calls).toHaveLength(1)
+  })
+
+  test("aborts during backoff without making another model call", async () => {
+    const controller = new AbortController()
+    const delays: number[] = []
+    let releaseSleep!: () => void
+    const sleepGate = new Promise<void>((resolve) => {
+      releaseSleep = resolve
+    })
+    let markSleepStarted!: () => void
+    const sleepStarted = new Promise<void>((resolve) => {
+      markSleepStarted = resolve
+    })
+    const harness = fakeContext({
+      text: async () => {
+        throw httpError(503)
+      },
+    })
+    const client = createModelClient(harness.ctx, makeConfig({ retries: 3 }), {
+      async sleep(ms) {
+        delays.push(ms)
+        markSleepStarted()
+        await sleepGate
+      },
+      random: () => 0,
+    })
+    const started = performance.now()
+
+    const pending = client.complete("p", controller.signal)
+    await sleepStarted
+    controller.abort()
+    const failure = await failureOf(pending)
+
+    expect(failure.kind).toBe("aborted")
+    expect(failure.retryable).toBe(false)
+    expect(harness.calls).toHaveLength(1)
+    expect(delays).toEqual([500])
+    expect(performance.now() - started).toBeLessThan(1_000)
+    releaseSleep()
   })
 
   test("fails with a config error when no model is configured", async () => {
