@@ -152,6 +152,7 @@ export interface FakeModelState {
   outputs: string[]
   errors: unknown[]
   gate?: Promise<void> | undefined
+  gates: Array<Promise<void> | undefined>
   calls: FakeModelCall[]
   inFlight: number
   maxInFlight: number
@@ -164,6 +165,8 @@ function createFakeModel(state: FakeModelState): ModelClient {
       state.inFlight += 1
       state.maxInFlight = Math.max(state.maxInFlight, state.inFlight)
       try {
+        const nextGate = state.gates.shift()
+        if (nextGate) await nextGate
         const gate = state.gate
         if (gate) await gate
         const error = state.errors.shift()
@@ -306,6 +309,7 @@ export function createTestEngine(options: TestEngineOptions = {}): TestEngineHar
   const modelState: FakeModelState = {
     outputs: [...(options.outputs ?? [])],
     errors: options.modelError === undefined ? [] : [options.modelError],
+    gates: [],
     calls: [],
     inFlight: 0,
     maxInFlight: 0,

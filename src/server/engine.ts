@@ -2,7 +2,7 @@ import type { SessionInfo, SessionMessageInfo } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
 import { CONFIG_SNIPPET, type TimelineConfig } from "../config.js"
 import { createDocument } from "../shared/document.js"
-import type { TimelineDocument, TimelineError, TimelineEstimate } from "../shared/types.js"
+import type { TimelineDocument, TimelineError, TimelineEstimate, TimelineWatermark } from "../shared/types.js"
 import { applyOutput } from "./apply.js"
 import { chunkMessages, estimateBackfill } from "./chunk.js"
 import { type Clock, systemClock, type TimerHandle } from "./clock.js"
@@ -30,6 +30,18 @@ export type RefreshReason = "idle" | "open" | "manual" | "force"
 const DISABLED_REASON = "Recap is disabled."
 const MISSING_MODEL_REASON = `Recap requires an explicit \`model\`.\n${CONFIG_SNIPPET}`
 const SHUTTING_DOWN_REASON = "Recap is shutting down."
+
+type RemainingMessages = { kind: "messages"; messages: SessionMessageInfo[] } | { kind: "history-changed" }
+
+function remainingMessages(
+  messages: readonly SessionMessageInfo[],
+  watermark: TimelineWatermark | null,
+): RemainingMessages {
+  if (!watermark) return { kind: "messages", messages: [...messages] }
+  const slice = sliceAfterWatermark(messages, watermark)
+  if (slice.kind === "history-changed") return { kind: "history-changed" }
+  return { kind: "messages", messages: slice.kind === "new" ? slice.messages : [] }
+}
 
 export interface EngineEventSink {
   updated(data: { sessionID: string; status: string; chapterCount: number; taskCount: number; updatedAt: string }): void
@@ -122,6 +134,11 @@ export class TimelineEngine {
 
   private assertNotDeleted(sessionID: string): void {
     if (this.deletedSessions.has(sessionID)) throw this.sessionNotFound(sessionID)
+  }
+
+  private assertActive(sessionID: string): void {
+    if (this.deletedSessions.has(sessionID)) throw this.sessionNotFound(sessionID)
+    if (this.stopped) throw new TimelineFailure("internal", SHUTTING_DOWN_REASON)
   }
 
   private now(): number {
@@ -759,6 +776,7 @@ export class TimelineEngine {
         runtime.followUp = undefined
         runtime.rerun = false
         runtime.running = null
+        delete runtime.backfill
         runtime.progress = undefined
       }
     })()
@@ -831,6 +849,31 @@ export class TimelineEngine {
       }
       return { document: null, busy: false, needsBackfill: true, estimate }
     }
+    if (document.backfill && document.backfill.completedAt === undefined) {
+      return {
+        document,
+        busy: runtime.running !== null,
+        needsBackfill: true,
+        estimate: await this.remainingEstimate(sessionID, document),
+        ...(runtime.error ? { error: runtime.error } : {}),
+      }
+    }
+    if (document.status === "error" && document.watermark) {
+      return {
+        document,
+        busy: false,
+        needsBackfill: false,
+        ...(runtime.error ? { error: runtime.error } : {}),
+      }
+    }
+    if (document.meta.notice?.kind === "history-changed") {
+      return {
+        document,
+        busy: false,
+        needsBackfill: false,
+        ...(runtime.error ? { error: runtime.error } : {}),
+      }
+    }
     if (document.watermark === null) {
       const read = await readSessionMessages(this.deps.ctx, sessionID)
       const estimate = estimateBackfill(read.messages, this.deps.config)
@@ -847,7 +890,64 @@ export class TimelineEngine {
       }
       return { document, busy: false, needsBackfill: true, estimate }
     }
-    return { document, busy: runtime.running !== null, needsBackfill: false }
+    const lastChecked = Date.parse(document.meta.lastCheckedAt)
+    const due =
+      !Number.isFinite(lastChecked) ||
+      this.now() - lastChecked > this.deps.config.update.openRefreshAfterMinutes * 60_000
+    if (due && document.status !== "error") {
+      const read = await readSessionMessages(this.deps.ctx, sessionID)
+      if (this.isInactive(sessionID)) {
+        return {
+          document,
+          busy: runtime.running !== null,
+          needsBackfill: false,
+          ...(runtime.error ? { error: runtime.error } : {}),
+        }
+      }
+      const slice = sliceAfterWatermark(read.messages, document.watermark)
+      if (slice.kind === "new") {
+        // The panel should render the current document immediately; the refresh
+        // runs in the background and reports through events.
+        void this.refresh(sessionID, "open").catch((error) => {
+          this.log("open refresh failed", { sessionID, error: sanitizeError(error) })
+        })
+        return {
+          document,
+          busy: runtime.running !== null,
+          needsBackfill: false,
+          ...(runtime.error ? { error: runtime.error } : {}),
+        }
+      }
+      // A rewritten (non-partial) transcript surfaces on open, not at the next
+      // idle event. A partial (compacted) read keeps the document untouched; the
+      // idle path finalizes or falls back to the timestamp slice.
+      if (slice.kind === "history-changed" && !read.partial) {
+        const now = this.nowIso()
+        document.status = "stale"
+        document.meta.lastCheckedAt = now
+        document.meta.notice = {
+          kind: "history-changed",
+          message: "The transcript changed. Rebuild the timeline to continue.",
+          at: now,
+        }
+        await this.persist(sessionID, document)
+        if (this.isInactive(sessionID)) {
+          return {
+            document,
+            busy: runtime.running !== null,
+            needsBackfill: false,
+            ...(runtime.error ? { error: runtime.error } : {}),
+          }
+        }
+        this.emitUpdated(document)
+      }
+    }
+    return {
+      document,
+      busy: runtime.running !== null,
+      needsBackfill: false,
+      ...(runtime.error ? { error: runtime.error } : {}),
+    }
   }
 
   private async recoverInterrupted(sessionID: string): Promise<TimelineDocument | null> {
@@ -865,7 +965,312 @@ export class TimelineEngine {
     return document
   }
 
-  async backfill(_sessionID: string, _confirm = false): Promise<{ started: boolean; estimate: TimelineEstimate }> {
-    throw new TimelineFailure("invalid_request", "Backfill is not implemented yet.")
+  async backfill(sessionID: string, confirm = false): Promise<{ started: boolean; estimate: TimelineEstimate }> {
+    const info = await this.resolveSession(sessionID)
+    this.assertActive(sessionID)
+    this.assertEnabled()
+    const runtime = this.runtime(sessionID)
+    if (runtime.running) throw new TimelineFailure("busy", "A timeline job is already running.", { sessionID })
+
+    const document = await this.deps.store.load(sessionID)
+    this.assertActive(sessionID)
+    if (document?.watermark && (!document.backfill || document.backfill.completedAt !== undefined)) {
+      throw new TimelineFailure("invalid_request", "Recap already built; use rebuild.", { sessionID })
+    }
+
+    const read = await readSessionMessages(this.deps.ctx, sessionID)
+    this.assertActive(sessionID)
+    const remaining = remainingMessages(read.messages, document?.watermark ?? null)
+
+    if (remaining.kind === "history-changed" && !read.partial) {
+      const target = document ?? this.newDocument(info)
+      const now = this.nowIso()
+      target.status = "stale"
+      // A rewritten transcript cannot be resumed; only a rebuild can recover.
+      // Clear the incomplete backfill so `ensure` surfaces the notice rather
+      // than offering a resume that can never make progress.
+      target.backfill = null
+      target.meta.lastCheckedAt = now
+      target.meta.notice = {
+        kind: "history-changed",
+        message: "The transcript changed. Rebuild the timeline to continue.",
+        at: now,
+      }
+      await this.persist(sessionID, target)
+      if (this.isInactive(sessionID)) {
+        return { started: false, estimate: estimateBackfill([], this.deps.config) }
+      }
+      this.emitUpdated(target)
+      return { started: false, estimate: estimateBackfill([], this.deps.config) }
+    }
+
+    const messages = remaining.kind === "messages" ? remaining.messages : []
+    const estimate = estimateBackfill(messages, this.deps.config)
+    if (estimate.approxCalls > this.deps.config.backfill.confirmOverCalls && !confirm) {
+      throw new TimelineFailure("confirmation_required", "This backfill needs confirmation.", estimate)
+    }
+
+    if (messages.length === 0) {
+      const target = document ?? this.newDocument(info)
+      if (read.partial) {
+        target.coverage.partial = true
+        target.coverage.reason = "compacted-history"
+      }
+      delete target.meta.notice
+      // Resuming a backfill that has no remaining messages finalizes it rather
+      // than downgrading a document that already has chapters to "empty".
+      if (target.backfill && target.backfill.completedAt === undefined) {
+        target.backfill.processedMessages = target.backfill.totalMessages
+        target.backfill.completedAt = this.nowIso()
+      }
+      target.status = target.chapters.length > 0 ? "ready" : "empty"
+      target.meta.lastCheckedAt = this.nowIso()
+      await this.persist(sessionID, target)
+      return { started: false, estimate }
+    }
+
+    this.assertActive(sessionID)
+    if (runtime.running) throw new TimelineFailure("busy", "A timeline job is already running.", { sessionID })
+    const target = document ?? this.newDocument(info)
+    const started = this.startTask(
+      sessionID,
+      () => this.runBackfill(sessionID, info, target, messages, read.partial, read.messages.length),
+      // Catch up on messages that arrived during the backfill in exactly one
+      // forced pass; a threshold-skipped "open" refresh would leave them
+      // pending until the next idle event.
+      () => this.refreshOnce(sessionID, info, "force", true),
+    )
+    return { started: started.started, estimate }
+  }
+
+  private async runBackfill(
+    sessionID: string,
+    info: SessionInfo,
+    document: TimelineDocument,
+    messages: readonly SessionMessageInfo[],
+    partial: boolean,
+    // `TimelineWatermark.messageCount` is a diagnostic (spec §5.1): the transcript
+    // length of the read that produced this snapshot — never the cumulative
+    // backfill total across resumes.
+    contextLength: number,
+  ): Promise<void> {
+    const runtime = this.runtime(sessionID)
+    runtime.backfill = { cancelled: false }
+    const now = this.nowIso()
+    document.sessionTitle = info.title ?? document.sessionTitle
+    const alreadyProcessed = document.backfill?.processedMessages ?? 0
+    document.status = "backfilling"
+    document.backfill = {
+      processedMessages: alreadyProcessed,
+      totalMessages: alreadyProcessed + messages.length,
+      startedAt: document.backfill?.startedAt ?? now,
+    }
+    // Keep a local reference: property narrowing is not preserved across the
+    // awaits below, and the persisted document holds the same object.
+    const backfill = document.backfill
+    delete backfill.error
+    delete document.meta.notice
+    if (partial) {
+      document.coverage.partial = true
+      document.coverage.reason = "compacted-history"
+    }
+    await this.persist(sessionID, document)
+    if (this.isInactive(sessionID)) return
+    this.emitUpdated(document)
+
+    const chunks = chunkMessages(messages, this.deps.config)
+    let processed = alreadyProcessed
+
+    for (const chunk of chunks) {
+      if (this.isInactive(sessionID)) return
+      if (runtime.backfill?.cancelled) break
+
+      const digest = buildDigest(chunk, this.deps.config)
+      const last = chunk[chunk.length - 1]
+      if (!last) continue
+
+      if (digest.includedCount === 0) {
+        this.advanceWatermark(document, last, contextLength)
+        processed += chunk.length
+        backfill.processedMessages = processed
+        document.meta.lastCheckedAt = this.nowIso()
+        await this.persist(sessionID, document)
+        if (this.isInactive(sessionID)) return
+        this.emitProgress(sessionID, "backfill", processed, backfill.totalMessages, document.chapters.length)
+        continue
+      }
+
+      const prompt = buildPrompt({
+        document,
+        digest: digest.text,
+        evidence: digest.evidence,
+        config: this.deps.config,
+      })
+
+      let result: { output: ValidatedOutput; calls: number; chars: number }
+      try {
+        result = await this.callModel(prompt, digest.aliasMap)
+      } catch (error) {
+        if (this.isInactive(sessionID)) return
+        // A cancellation while the model call was in flight is not a failure:
+        // discard the result and let the loop mark the backfill paused.
+        if (runtime.backfill?.cancelled) break
+        const failure = toTimelineError(error, this.nowIso())
+        const callCount = error instanceof ModelCallFailure ? error.calls : 1
+        const charCount = error instanceof ModelCallFailure ? error.chars : prompt.length
+        const cause = error instanceof ModelCallFailure ? error.cause : error
+        if (cause instanceof ModelFailure && (cause.kind === "auth" || cause.kind === "config")) {
+          this.disabledReason = sanitizeError(cause)
+        }
+        document.status = "error"
+        backfill.error = failure.message
+        document.meta.lastError = failure
+        document.meta.lastCheckedAt = this.nowIso()
+        this.recordCalls(document, charCount, false, callCount)
+        await this.persist(sessionID, document)
+        if (this.isInactive(sessionID)) return
+        this.emitUpdated(document)
+        this.emitError(sessionID, failure)
+        delete runtime.backfill
+        return
+      }
+
+      if (this.isInactive(sessionID)) return
+      if (runtime.backfill?.cancelled) break
+
+      applyOutput(document, {
+        output: result.output,
+        now: this.nowIso(),
+        coveragePartial: partial,
+        model: this.deps.config.model!,
+        promptVersion: PROMPT_VERSION,
+        log: this.log,
+      })
+      this.advanceWatermark(document, last, contextLength)
+      processed += chunk.length
+      backfill.processedMessages = processed
+      document.status = "backfilling"
+      document.meta.lastCheckedAt = this.nowIso()
+      this.recordCalls(document, result.chars, false, result.calls)
+      await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
+      this.emitProgress(sessionID, "backfill", processed, backfill.totalMessages, document.chapters.length)
+    }
+
+    if (this.isInactive(sessionID)) return
+
+    if (runtime.backfill?.cancelled) {
+      document.status = document.watermark ? "paused" : "empty"
+      backfill.cancelled = true
+      delete backfill.completedAt
+      document.meta.lastCheckedAt = this.nowIso()
+      await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
+      this.emitUpdated(document)
+      delete runtime.backfill
+      return
+    }
+
+    backfill.completedAt = this.nowIso()
+    document.status = "ready"
+    document.meta.lastCheckedAt = this.nowIso()
+    delete document.meta.lastError
+    await this.persist(sessionID, document)
+    if (this.isInactive(sessionID)) return
+    this.emitUpdated(document)
+    delete runtime.backfill
+
+    const latest = await readSessionMessages(this.deps.ctx, sessionID)
+    if (this.isInactive(sessionID)) return
+    const slice = sliceAfterWatermark(latest.messages, document.watermark)
+    if (slice.kind === "new") {
+      document.status = "stale"
+      await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
+      this.emitUpdated(document)
+      runtime.rerun = true
+    } else if (slice.kind === "history-changed" && !latest.partial) {
+      const checkedAt = this.nowIso()
+      document.status = "stale"
+      document.meta.lastCheckedAt = checkedAt
+      document.meta.notice = {
+        kind: "history-changed",
+        message: "The transcript changed. Rebuild the timeline to continue.",
+        at: checkedAt,
+      }
+      await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
+      this.emitUpdated(document)
+    }
+  }
+
+  async rebuild(sessionID: string, confirm = false): Promise<{ started: boolean; estimate: TimelineEstimate }> {
+    const info = await this.resolveSession(sessionID)
+    this.assertActive(sessionID)
+    this.assertEnabled()
+    const runtime = this.runtime(sessionID)
+    if (runtime.running) throw new TimelineFailure("busy", "A timeline job is already running.", { sessionID })
+
+    const read = await readSessionMessages(this.deps.ctx, sessionID)
+    this.assertActive(sessionID)
+    const estimate = estimateBackfill(read.messages, this.deps.config)
+    if (!confirm) {
+      throw new TimelineFailure("confirmation_required", "Rebuilding clears the existing timeline.", estimate)
+    }
+
+    this.assertActive(sessionID)
+    if (runtime.running) throw new TimelineFailure("busy", "A timeline job is already running.", { sessionID })
+    await this.deps.store.remove(sessionID).catch(() => undefined)
+    this.assertActive(sessionID)
+    delete runtime.error
+    delete runtime.backfill
+
+    if (read.messages.length === 0) {
+      const document = this.newDocument(info)
+      document.status = "empty"
+      await this.persist(sessionID, document)
+      return { started: false, estimate }
+    }
+
+    if (runtime.running) throw new TimelineFailure("busy", "A timeline job is already running.", { sessionID })
+    const document = this.newDocument(info)
+    const started = this.startTask(
+      sessionID,
+      () => this.runBackfill(sessionID, info, document, read.messages, read.partial, read.messages.length),
+      // Catch up on messages that arrived during the backfill in exactly one
+      // forced pass; a threshold-skipped "open" refresh would leave them
+      // pending until the next idle event.
+      () => this.refreshOnce(sessionID, info, "force", true),
+    )
+    return { started: started.started, estimate }
+  }
+
+  async cancel(sessionID: string): Promise<{ cancelled: boolean }> {
+    await this.resolveSession(sessionID)
+    const runtime = this.runtimeBySession.get(sessionID)
+    if (!runtime?.backfill) return { cancelled: false }
+    runtime.backfill.cancelled = true
+    return { cancelled: true }
+  }
+
+  private newDocument(info: SessionInfo): TimelineDocument {
+    return createDocument({
+      sessionID: info.id,
+      sessionTitle: info.title ?? null,
+      model: this.deps.config.model!,
+      promptVersion: PROMPT_VERSION,
+      now: this.nowIso(),
+    })
+  }
+
+  private async remainingEstimate(sessionID: string, document: TimelineDocument): Promise<TimelineEstimate> {
+    const read = await readSessionMessages(this.deps.ctx, sessionID)
+    const remaining = remainingMessages(read.messages, document.watermark)
+    // A non-partial rewrite cannot be resumed; report zero remaining messages.
+    // `backfill` persists the history-changed notice when the user retries.
+    if (remaining.kind === "history-changed" && !read.partial) {
+      return estimateBackfill([], this.deps.config)
+    }
+    return estimateBackfill(remaining.kind === "messages" ? remaining.messages : [], this.deps.config)
   }
 }
