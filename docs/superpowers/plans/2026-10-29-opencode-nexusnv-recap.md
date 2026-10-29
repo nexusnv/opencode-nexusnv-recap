@@ -731,15 +731,22 @@ export function deriveHeader(document: TimelineDocument): TimelineHeader {
             type: highlight.artifact.type,
             label: artifactLabel(highlight),
             url: highlight.artifact.url,
-            state: highlight.artifact.state,
+            ...(highlight.artifact.type === "pr" && highlight.artifact.state
+              ? { state: highlight.artifact.state }
+              : {}),
             at: highlight.at,
           })
         } else {
           // Reverse chronological walk: the first sighting is the newest.
-          // Only fill a missing state from an older highlight; never let an
-          // older "opened" overwrite a newer "merged".
+          // Only fill a missing state from an older PR highlight; never let an
+          // older "opened" overwrite a newer "merged". Commits have no state.
           const entry = artifacts[existing]
-          if (entry && entry.state === undefined && highlight.artifact.state) {
+          if (
+            entry &&
+            entry.state === undefined &&
+            highlight.artifact.type === "pr" &&
+            highlight.artifact.state
+          ) {
             entry.state = highlight.artifact.state
           }
         }
@@ -2389,7 +2396,7 @@ Cover:
 - Extend never moves `startedAt` backward; `endedAt` takes the max.
 - A highlight with duplicate normalized text in the same chapter is dropped.
 - A highlight's `at` comes from the resolved anchor, never from the model.
-- A commit artifact drops `state`; a PR artifact keeps it.
+- A commit artifact built directly (not via `parseModelOutput`) drops `state`; a PR artifact keeps it.
 - `coverage.partial` becomes true when `coveragePartial` is true; it never becomes false.
 - `meta.model` and `meta.promptVersion` are updated.
 - An empty output (no goal, tasks null, no chapters) is a no-op.
@@ -2402,6 +2409,7 @@ import type {
   TimelineChapter,
   TimelineDocument,
   TimelineHighlight,
+  TimelineHighlightArtifact,
   TimelineModelRef,
   TimelineTask,
 } from "../shared/types.js"
@@ -2502,6 +2510,7 @@ function applyChapter(document: TimelineDocument, incoming: ValidatedChapter, no
 
 function toHighlight(highlight: ValidatedHighlight): TimelineHighlight | undefined {
   if (!highlight.anchorMessageID || !highlight.text) return undefined
+  const artifact = toArtifact(highlight.artifact)
   return {
     id: `hl_${randomUUID()}`,
     kind: highlight.kind,
@@ -2509,8 +2518,19 @@ function toHighlight(highlight: ValidatedHighlight): TimelineHighlight | undefin
     at: highlight.at,
     anchorMessageID: highlight.anchorMessageID,
     ...(highlight.task ? { task: highlight.task } : {}),
-    ...(highlight.artifact ? { artifact: highlight.artifact } : {}),
+    ...(artifact ? { artifact } : {}),
   }
+}
+
+function toArtifact(artifact: ValidatedHighlight["artifact"]): TimelineHighlightArtifact | undefined {
+  if (!artifact) return undefined
+  // Commit artifacts carry no PR state. `parseModelOutput` strips it, but
+  // `applyOutput` is also called with directly constructed validated output
+  // in tests and must enforce the invariant itself.
+  if (artifact.type === "commit") {
+    return { type: "commit", ...(artifact.url ? { url: artifact.url } : {}) }
+  }
+  return artifact
 }
 
 function earliest(...values: string[]): string {
@@ -3594,7 +3614,28 @@ async backfill(
   }
 
   const read = await readSessionMessages(this.deps.ctx, sessionID)
-  const messages = remainingMessages(read.messages, document?.watermark ?? null)
+  const remaining = remainingMessages(read.messages, document?.watermark ?? null)
+
+  if (remaining.kind === "history-changed" && !read.partial) {
+    const target = document ?? this.newDocument(info)
+    const now = this.nowIso()
+    target.status = "stale"
+    // A rewritten transcript cannot be resumed; only a rebuild can recover.
+    // Clear the incomplete backfill so `ensure` surfaces the notice rather
+    // than offering a resume that can never make progress.
+    target.backfill = null
+    target.meta.lastCheckedAt = now
+    target.meta.notice = {
+      kind: "history-changed",
+      message: "The transcript changed. Rebuild the timeline to continue.",
+      at: now,
+    }
+    await this.persist(sessionID, target)
+    this.emitUpdated(target)
+    return { started: false, estimate: estimateBackfill([], this.deps.config) }
+  }
+
+  const messages = remaining.kind === "messages" ? remaining.messages : []
   const estimate = estimateBackfill(messages, this.deps.config)
   if (estimate.approxCalls > this.deps.config.backfill.confirmOverCalls && !confirm) {
     throw new TimelineFailure("confirmation_required", "This backfill needs confirmation.", estimate)
@@ -3602,6 +3643,11 @@ async backfill(
 
   if (messages.length === 0) {
     const target = document ?? this.newDocument(info)
+    if (read.partial) {
+      target.coverage.partial = true
+      target.coverage.reason = "compacted-history"
+    }
+    delete target.meta.notice
     // Resuming a backfill that has no remaining messages finalizes it rather
     // than downgrading a document that already has chapters to "empty".
     if (target.backfill && target.backfill.completedAt === undefined) {
@@ -3630,13 +3676,18 @@ async backfill(
 `remainingMessages`:
 
 ```ts
+type RemainingMessages =
+  | { kind: "messages"; messages: SessionMessageInfo[] }
+  | { kind: "history-changed" }
+
 function remainingMessages(
   messages: readonly SessionMessageInfo[],
   watermark: TimelineWatermark | null,
-): SessionMessageInfo[] {
-  if (!watermark) return [...messages]
+): RemainingMessages {
+  if (!watermark) return { kind: "messages", messages: [...messages] }
   const slice = sliceAfterWatermark(messages, watermark)
-  return slice.kind === "new" ? slice.messages : []
+  if (slice.kind === "history-changed") return { kind: "history-changed" }
+  return { kind: "messages", messages: slice.kind === "new" ? slice.messages : [] }
 }
 ```
 
@@ -3784,6 +3835,17 @@ private async runBackfill(
     await this.persist(sessionID, document)
     this.emitUpdated(document)
     runtime.rerun = true
+  } else if (slice.kind === "history-changed" && !latest.partial) {
+    const now = this.nowIso()
+    document.status = "stale"
+    document.meta.lastCheckedAt = now
+    document.meta.notice = {
+      kind: "history-changed",
+      message: "The transcript changed. Rebuild the timeline to continue.",
+      at: now,
+    }
+    await this.persist(sessionID, document)
+    this.emitUpdated(document)
   }
 }
 ```
@@ -3868,7 +3930,13 @@ if (document.meta.notice?.kind === "history-changed") {
 ```ts
 private async remainingEstimate(sessionID: string, document: TimelineDocument): Promise<TimelineEstimate> {
   const read = await readSessionMessages(this.deps.ctx, sessionID)
-  return estimateBackfill(remainingMessages(read.messages, document.watermark), this.deps.config)
+  const remaining = remainingMessages(read.messages, document.watermark)
+  // A non-partial rewrite cannot be resumed; report zero remaining messages.
+  // `backfill` persists the history-changed notice when the user retries.
+  if (remaining.kind === "history-changed" && !read.partial) {
+    return estimateBackfill([], this.deps.config)
+  }
+  return estimateBackfill(remaining.kind === "messages" ? remaining.messages : [], this.deps.config)
 }
 ```
 
@@ -3909,6 +3977,9 @@ Cover:
 12. **No messages:** `ensure`/`backfill` create an empty document with no model call.
 13. **Interrupted restart:** a persisted `backfilling` document with no runtime is returned as `paused`.
 14. **Cap:** backfill calls are recorded with `automatic: false` and do not consume `recentAutoCalls`.
+15. **Transcript rewritten during a paused backfill:** watermark ID missing, no later messages, and a non-partial read → `backfill` returns `started: false`, makes zero model calls, clears the incomplete `backfill`, sets `status = "stale"` and `meta.notice.kind = "history-changed"`, and does not finalize the backfill.
+16. **Compacted watermark during a paused backfill:** the same missing watermark but a partial read → `coverage.partial = true`, no `history-changed` notice, and the backfill finalizes with no model call.
+17. **Transcript rewritten during the final read:** a completed backfill whose final read is non-partial `history-changed` sets `status = "stale"` plus the notice instead of leaving `ready`.
 
 **Step 6: Verify**
 
@@ -4731,7 +4802,7 @@ import { TimelineRpc } from "./rpc.js"
 import { TimelineService } from "./server/service.js"
 import { PluginTimelineStore } from "./server/store.js"
 import { createModelClient } from "./server/model.js"
-import { TimelineFailure } from "./server/errors.js"
+import { TimelineFailure, sanitizeError } from "./server/errors.js"
 import { parseBackfillInput, parseExcerptInput, parseSessionInput } from "./shared/contract.js"
 import { SERVER_PLUGIN_ID } from "./shared/ids.js"
 
@@ -4795,9 +4866,10 @@ async function guard<Value>(call: unknown, run: () => Promise<Value>): Promise<V
       return factory.error(error.code, error.message, errorData(error)) as never
     }
     if (error instanceof TypeError) {
-      return factory.error("invalid_request", error.message, { message: error.message }) as never
+      const message = sanitizeError(error)
+      return factory.error("invalid_request", message, { message }) as never
     }
-    const message = error instanceof Error ? error.message : "Recap request failed"
+    const message = sanitizeError(error)
     return factory.error("internal", message, { message }) as never
   }
 }
@@ -5489,10 +5561,52 @@ export function panelInput(overrides: Partial<PanelInput> = {}): PanelInput {
 ```ts
 import { expect, test } from "bun:test"
 import { file } from "bun"
+import { existsSync, readFileSync, readdirSync } from "node:fs"
+import { join, relative, resolve } from "node:path"
+
+const root = resolve(import.meta.dir, "..")
+const HOST_RUNTIME =
+  /^(?:solid-js(?:\/store)?|@opentui\/(?:core|solid)(?:\/.*)?|@opencode\/plugin\/tui(?:\/.*)?)$/
+const FROM = /(?:^|\W)(?:import|export)\s+(?!type\b)[^"'`]*?\bfrom\s*["']([^"']+)["']/
+const SIDE_EFFECT = /^\s*import\s*["']([^"']+)["']/
+const DYNAMIC = /\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/
+
+function hostRuntimeImport(line: string): string | undefined {
+  for (const pattern of [FROM, SIDE_EFFECT, DYNAMIC]) {
+    const specifier = pattern.exec(line)?.[1]
+    if (specifier && HOST_RUNTIME.test(specifier)) return specifier
+  }
+  return undefined
+}
+
+function sourceFiles(path: string): string[] {
+  if (!existsSync(path)) return []
+  return readdirSync(path, { withFileTypes: true }).flatMap((entry) => {
+    const entryPath = join(path, entry.name)
+    if (entry.isDirectory()) return sourceFiles(entryPath)
+    return entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts") ? [entryPath] : []
+  })
+}
 
 test("TUI state uses .tsx so the host Solid transform applies", async () => {
   expect(await file("src/tui/state.ts").exists()).toBe(false)
   expect(await file("src/tui/state.tsx").exists()).toBe(true)
+})
+
+test("host runtime matcher allows type-only imports", () => {
+  expect(hostRuntimeImport('import type { Context } from "@opencode/plugin/tui/context"')).toBeUndefined()
+  expect(hostRuntimeImport('import { createSignal } from "solid-js"')).toBe("solid-js")
+})
+
+test("host runtime imports appear only in .tsx sources", () => {
+  const violations: string[] = []
+  for (const path of sourceFiles(resolve(root, "src"))) {
+    for (const [index, line] of readFileSync(path, "utf8").split("\n").entries()) {
+      const specifier = hostRuntimeImport(line)
+      if (specifier) violations.push(`${relative(root, path)}:${index + 1}: ${specifier}`)
+    }
+  }
+  expect(violations).toEqual([])
 })
 ```
 
@@ -6064,6 +6178,11 @@ function build(): void {
     props.context.ui.toast.show({ message: "Backfill in progress", variant: "info" })
     return
   }
+  // A rewritten transcript is not resumable; only a rebuild clears the notice.
+  if (value?.meta.notice?.kind === "history-changed") {
+    void confirmStart("rebuild")
+    return
+  }
   // Paused or interrupted backfills must resume, not rebuild from scratch.
   const resuming =
     value?.status === "paused" ||
@@ -6117,6 +6236,7 @@ never call `ensure`. Render the states in this order:
    - If `state.busy()` and `document()` is null: "Building recap…" + "x to cancel". `ensure` can auto-start a backfill before the first document write lands.
    - If `document()` exists and `document()!.status === "error"`: use `state.error()?.message ?? document()!.meta.lastError?.message ?? "Recap update failed"` + "b to resume/rebuild" + "r to retry". Check this before the generic build prompt so a failed backfill shows its error.
    - If `document()` exists and `document()!.status === "paused"`: "Backfill paused at N/M messages — b to resume."
+   - If the session has no messages (`document()?.status === "empty"`, `document()?.watermark === null`, `!state.needsBackfill()`, and `!state.busy()`): "No messages yet."
    - If `state.needsBackfill()` or `document()?.watermark === null`: "Build recap from this session's history" + estimate (`messages`, `approxCalls`) + "b to build". The persisted `meta.lastError` survives a restart; the runtime error does not.
 6. **Ready:** header + timeline.
    - If `chapters.length === 0`: "No milestones found yet. New activity will update this recap."
@@ -6142,7 +6262,8 @@ Cover:
 
 Cover each state:
 
-- **Empty:** build prompt + estimate.
+- **Empty session:** "No messages yet"; no build prompt; `b` does not call `backfill`.
+- **Empty document with history:** build prompt + estimate; `b` calls `backfill(false)`.
 - **Needs confirmation:** `b` calls `backfill(false)`, receives `confirmation_required`, shows `dialog.confirm`, and calls `backfill(true)` on confirm.
 - **Backfilling:** progress text and `x` calls `cancel`.
 - **Paused:** "Backfill paused" + `b` resumes.
@@ -6150,7 +6271,7 @@ Cover each state:
 - **No milestones:** "No milestones found yet".
 - **Stale:** "New activity — r to refresh".
 - **Hourly cap notice:** banner text; `r` calls `refresh`.
-- **History changed notice:** banner text; `r` shows a toast and does **not** call `refresh`.
+- **History changed notice:** banner text; `r` shows a toast and does **not** call `refresh`; `b` calls `rebuild(false)` rather than `backfill`.
 - **Error:** message + `r` retries.
 - **Disabled:** reason + config snippet; no RPC model calls.
 - **Child:** root-only message; no `ensure` call.
