@@ -1,0 +1,5 @@
+export const SERVER_PLUGIN_ID = "nexusnv.recap"
+export const TUI_PLUGIN_ID = "nexusnv.recap.tui"
+export const RPC_ID = "nexusnv.recap"
+export const STORAGE_PREFIX = "recap/v1/session"
+export const PANEL_NAME = "recap"

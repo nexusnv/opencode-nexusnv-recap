@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-nexusnv-recap",
+  "version": "0.1.0",
+  "description": "Per-session recap timeline of decisions, implementations, task changes, and PRs for OpenCode V2.",
+  "type": "module",
+  "license": "MIT",
+  "author": "nexusnv",
+  "homepage": "https://github.com/nexusnv/opencode-nexusnv-recap#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nexusnv/opencode-nexusnv-recap.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nexusnv/opencode-nexusnv-recap/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "recap",
+    "timeline",
+    "session",
+    "tui"
+  ],
+  "packageManager": "bun@1.4.0",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./tui": "./dist/tui.js",
+    "./rpc": "./dist/rpc.js"
+  },
+  "files": [
+    "dist/",
+    "index.ts",
+    "tui.tsx",
+    "rpc.ts",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "prepack": "bun run build",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src test scripts index.ts tui.tsx",
+    "lint:fix": "oxlint --fix src test scripts index.ts tui.tsx",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "bun run build && bun test",
+    "test:watch": "bun test --watch",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test",
+    "pack:check": "bun run build && bun run scripts/assert-pack.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.6.8",
+    "@opentui/solid": ">=0.6.8",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opencode/client": "2.1.4",
+    "@opencode/plugin": "2.1.4",
+    "@opencode/theme": "2.1.4",
+    "@opentui/core": "0.6.8",
+    "@opentui/solid": "0.6.8",
+    "@types/bun": "1.4.4",
+    "@types/node": "24.12.2",
+    "oxlint": "1.89.0",
+    "prettier": "3.9.10",
+    "solid-js": "1.9.15",
+    "typescript": "5.9.3"
+  }
+}
