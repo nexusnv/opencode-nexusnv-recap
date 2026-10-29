@@ -1,9 +1,11 @@
-# OpenCode Nexusnv Timeline — Design
+# OpenCode Nexusnv Recap — Design
 
 **Date:** 2026-10-29
-**Status:** Design approved in brainstorming; spec self-reviewed and awaiting user review before implementation planning
-**Package:** `opencode-nexusnv-timeline`
-**Plugin IDs:** `nexusnv.timeline` (server), `nexusnv.timeline.tui` (TUI)
+**Status:** Design approved; implementation plan drafted and awaiting user approval
+**Package:** `opencode-nexusnv-recap`
+**Plugin IDs:** `nexusnv.recap` (server), `nexusnv.recap.tui` (TUI)
+
+The product is **Recap**; the panel it produces is a chronological **session timeline**. Internal domain types keep the `Timeline*` prefix because they describe that data structure, not the package name.
 
 ## 1. Problem
 
@@ -71,7 +73,7 @@ OpenCode server
 │   └── RPC: get / ensure / backfill / refresh / rebuild / cancel / excerpt
 │
 └── TUI plugin (src/tui.tsx)
-    ├── /timeline command + session.panel contribution
+    ├── /recap command + session.panel contribution
     ├── panel: status header + chapter accordion + excerpt dialog
     └── thin RPC client; no model calls, no storage
 ```
@@ -220,7 +222,7 @@ type TimelineDocument = {
 
 ### 5.3 Storage
 
-- Prefix: `timeline/v1/session/<sessionID>`
+- Prefix: `recap/v1/session/<sessionID>`
 - One document per session, written with a single `storage.set`. Readers never observe a partially written document; a failed write leaves the previous value intact.
 - In-memory per-session mutex plus a global model-call semaphore. Plugin storage has no compare-and-swap; single-process single-flight is sufficient for one OpenCode server.
 - On `session.deleted`, remove the document if the event is available; otherwise delete lazily when a read finds the session missing. This is storage cleanup only, not model work.
@@ -564,7 +566,7 @@ If the runtime exposes full-history pagination, the engine uses it and `partial`
 
 ## 10. RPC contract
 
-RPC id: `nexusnv.timeline`. Defined with `Rpc.define` and shared portable JSON Schemas (`as const`, matching the sibling plugin). The TUI imports the contract from `./rpc`. Model output is validated separately with a strict runtime schema (Zod or equivalent).
+RPC id: `nexusnv.recap`. Defined with `Rpc.define` and shared portable JSON Schemas (`as const`, matching the sibling plugin). The TUI imports the contract from `./rpc`. Model output is validated separately with a strict runtime schema (Zod or equivalent).
 
 ### 10.1 Methods
 
@@ -624,7 +626,7 @@ The RPC validates that the session exists and belongs to the plugin's project (p
 One column, usable in a narrow side panel and fullscreen:
 
 ```text
-Timeline                                  READY · 2m ago · gpt-5-mini
+Recap                                     READY · 2m ago · gpt-5-mini
 Goal  Add a session timeline plugin for OpenCode
 Tasks 3/7 done   open: TUI panel, backfill, tests
 Decisions  server-owned engine; append-only chapters
@@ -666,7 +668,7 @@ Artifacts  PR #42 opened
 
 ### 11.4 Commands and keys
 
-- Global command: "Open session timeline", slash `/timeline`, palette entry. Enabled only when a session is selected. No default keybind, to avoid conflicts.
+- Global command: "Open session recap", slash `/recap`, palette entry. Enabled only when a session is selected. No default keybind, to avoid conflicts. The name avoids the host's built-in `session.timeline` command.
 - Panel-scoped, only when focused:
   - `j`/`down`, `k`/`up`: move across chapters and visible highlights.
   - `enter`: expand/collapse a chapter, or open the excerpt for a highlight.
@@ -688,7 +690,7 @@ Artifacts  PR #42 opened
 ```jsonc
 {
   "plugins": [{
-    "package": "opencode-nexusnv-timeline",
+    "package": "opencode-nexusnv-recap",
     "options": {
       "enabled": true,
       "model": { "providerID": "openai", "modelID": "gpt-5-mini" },
@@ -785,7 +787,7 @@ Artifacts  PR #42 opened
 
 ### Manual smoke
 
-- Load the plugin locally; open `/timeline` on a long session.
+- Load the plugin locally; open `/recap` on a long session.
 - Confirm backfill, watch progress, close and reopen the panel.
 - Restart OpenCode; verify persistence.
 - Use an invalid model; verify the disabled state and zero calls.
