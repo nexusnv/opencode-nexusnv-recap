@@ -602,7 +602,7 @@ type ExcerptItem = {
 | `progress` | `{ sessionID, phase: "backfill" \| "update", processed, total, chapters }` |
 | `error` | `{ sessionID, kind, message, retryable }` |
 
-The TUI subscribes, filters by `sessionID`, and refetches `get` on `updated`, on `error`, and on `progress` when the chapter count changes. Events are live-only; opening the panel always refetches. `updated` is emitted on successful updates and on status transitions such as `stale`, `error`, cap/history notices, and backfill cancellation.
+The TUI subscribes, filters by `sessionID`, and refetches `ensure` on `updated`, on `error`, and on `progress` when the chapter count changes. Events are live-only; opening the panel always refetches. `updated` is emitted on successful updates and on status transitions such as `stale`, `error`, cap/history notices, and backfill cancellation.
 
 ### 10.3 Errors
 
@@ -825,7 +825,7 @@ Artifacts  PR #42 opened
 |---|---|
 | `ctx.session.context` loses pre-compaction history | Mark coverage partial; seed from the compaction summary; use full-history pagination if the runtime exposes it |
 | The compaction summary is absent from `context` | Mark partial from the runtime's compaction signal; never claim coverage of the dropped transcript |
-| One-shot generate API differs by OpenCode version | Adapter prefers `ctx.experimental.generate.text`, falls back to `ctx.generate.text`; maps `modelID` to the API's `id`; document the tested version |
+| One-shot generate API differs by OpenCode version | Adapter probes `ctx.experimental.generate.text` and falls back to `ctx.generate.text` (2.1.4 has no `experimental.generate`); maps `modelID` to the API's `id`; document the tested version |
 | Cheap model produces weak chapter boundaries | Prompt versioning, strict limits, rebuild action; two-stage extraction is the fallback upgrade |
 | Model hallucinates PR/test results | Evidence block, factuality rules, anchor validation, excerpt verification |
 | Long backfill cost | Estimate, confirmation over 10 calls, progress, cancel, resume |

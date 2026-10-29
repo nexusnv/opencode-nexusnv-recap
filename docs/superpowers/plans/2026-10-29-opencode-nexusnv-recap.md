@@ -12,7 +12,7 @@
 
 **Naming:** The package, plugin IDs, storage namespace, panel name, and slash command use **Recap** (`/recap`). `Timeline*` remains the internal domain prefix because it describes the chronological document, not the product name.
 
-**Tested API baseline:** `@opencode/plugin` / `@opencode/theme` 2.1.4, `@opentui/core` / `@opentui/solid` 0.6.8, Bun 1.4.0. The installed 2.1.4 server context does **not** expose `ctx.session.message.list`; the reader capability-checks and falls back to `ctx.session.context`.
+**Tested API baseline:** `@opencode/plugin` / `@opencode/theme` 2.1.4, `@opentui/core` / `@opentui/solid` 0.6.8, Bun 1.4.0. The installed 2.1.4 server context does **not** expose `ctx.session.message.list`; the reader capability-checks and falls back to `ctx.session.context`. The installed 2.1.4 `Context.experimental` carries only `terminal` — there is no `experimental.generate`; the model adapter probes it for forward compatibility and calls `ctx.generate.text` on 2.1.4.
 
 ---
 
@@ -115,6 +115,7 @@
     "solid-js": { "optional": true }
   },
   "devDependencies": {
+    "@opencode/client": "2.1.4",
     "@opencode/plugin": "2.1.4",
     "@opencode/theme": "2.1.4",
     "@opentui/core": "0.6.8",
@@ -128,6 +129,11 @@
   }
 }
 ```
+
+`@opencode/client` is declared even though `@opencode/plugin` 2.1.4 already depends on
+it transitively: the reader, digest, chunking, engine, and excerpt modules import its
+`SessionMessageInfo` / `SessionInfo` types directly, and resolution must not rely on
+dependency hoisting.
 
 **Step 2: Create `tsconfig.json`**
 
@@ -1275,6 +1281,7 @@ Cover each rule from spec §6.3:
 - `write` input includes the path and content line count, not `content`.
 - Tool results are capped at `maxToolResultChars`; `file` content parts are dropped.
 - Shell output is included for a normal command but omitted for `cat`, `head`, `tail`, `less`, `sed -n`.
+- The `Checks` evidence line lists test/lint/typecheck/build commands with a `passed`/`failed` status derived from command and exit code; non-check commands do not appear on that line.
 - Compaction summary is included, capped at `maxCompactionChars`.
 - Synthetic, system, skill, idle, agent-switched, model-switched, and location-switched messages are ignored.
 - Aliases are sequential (`m1`, `m2`, …), each mapped to a real message ID and UTC timestamp.
@@ -1371,16 +1378,31 @@ function shouldIncludeTool(part: SessionMessageAssistantTool): boolean {
 `buildEvidence` (in `src/server/evidence.ts`):
 
 ```ts
+// Test/lint/typecheck/build commands for the spec's evidence `Checks` line.
+// Heuristic on common runner names; a shipped plugin cannot know every runner.
+const CHECK_COMMANDS =
+  /\b(tests?|vitest|pytest|jest|mocha|phpunit|spec|lint|eslint|oxlint|biome|prettier|phpstan|psalm|typecheck|tsc|coverage|clippy|golangci|build)\b/
+
+function isCheckCommand(command: unknown): boolean {
+  const value = safeString(command)
+  return value !== undefined && CHECK_COMMANDS.test(value)
+}
+
 export function buildEvidence(messages: readonly SessionMessageInfo[], config: TimelineConfig): string {
   const lines: string[] = []
   const files = new Set<string>()
   const commands = new Set<string>()
+  const checks = new Map<string, "passed" | "failed">()
   const refs = new Set<string>()
   const todos: string[] = []
 
   for (const message of messages) {
     if (message.type === "shell") {
       commands.add(clip(message.command, 160))
+      if (isCheckCommand(message.command)) {
+        const passed = message.status === "exited" && message.exit === 0
+        checks.set(clip(message.command, 120), passed ? "passed" : "failed")
+      }
       if (message.output) collectRefs(message.output.output, refs)
     }
     if (message.type !== "assistant") continue
@@ -1395,6 +1417,10 @@ export function buildEvidence(messages: readonly SessionMessageInfo[], config: T
       if (name === "shell" || name === "bash") {
         const command = safeString(input.command)
         if (command) commands.add(clip(command, 160))
+        const settled = part.state.status !== "running" && part.state.status !== "streaming"
+        if (command && settled && isCheckCommand(command)) {
+          checks.set(clip(command, 120), part.state.status === "error" ? "failed" : "passed")
+        }
       }
       if (name === "todowrite" && Array.isArray(input.todos)) {
         for (const todo of input.todos.slice(0, 20)) {
@@ -1408,6 +1434,11 @@ export function buildEvidence(messages: readonly SessionMessageInfo[], config: T
 
   if (files.size) lines.push(`Files touched: ${[...files].slice(0, 20).join(", ")}`)
   if (commands.size) lines.push(`Commands: ${[...commands].slice(0, 20).join(" | ")}`)
+  if (checks.size) {
+    lines.push(
+      `Checks: ${[...checks].slice(0, 10).map(([command, status]) => `${command} ${status}`).join(" | ")}`,
+    )
+  }
   if (todos.length) lines.push(`Todos: ${todos.slice(0, 12).join(" | ")}`)
   if (refs.size) lines.push(`References: ${[...refs].slice(0, 20).join(" | ")}`)
   return clip(lines.join("\n"), 2_000)
@@ -2164,7 +2195,7 @@ const generate = {
 Cover:
 
 - Calls `ctx.generate.text` with `{ prompt, model: { providerID, id, variant? } }`; the config's `modelID` maps to the API's `id`.
-- Uses `ctx.experimental.generate.text` when present.
+- Prefers `ctx.experimental.generate.text` when a host exposes it. 2.1.4 does not (`Context.experimental` has only `terminal`), so the probe is forward-compatibility and the real path under the tested baseline is `ctx.generate.text`.
 - Falls back to `ctx.generate.text` when the experimental API is absent.
 - Returns `result.text`.
 - Rejects a non-string/empty result as a `ModelFailure` with kind `"model"`.
@@ -2242,6 +2273,9 @@ export function createModelClient(
   }
 }
 
+// 2.1.4 exposes only `experimental.terminal`; there is no `experimental.generate`.
+// The probe is forward-compatibility: a future host that re-adds the API is
+// picked up automatically, and 2.1.4 always resolves to `ctx.generate`.
 function resolveGenerate(ctx: Pick<Plugin.Context, "generate" | "experimental">): GenerateLike {
   const experimental = (ctx.experimental as unknown as { generate?: GenerateLike }).generate
   return experimental ?? (ctx.generate as unknown as GenerateLike)
@@ -2370,6 +2404,8 @@ export interface ApplyInput {
   coveragePartial: boolean
   model: TimelineModelRef
   promptVersion: number
+  /** Optional engine logger; logs IDs only, never prompt or message content. */
+  log?: (message: string, data?: Record<string, unknown>) => void | undefined
 }
 
 export function applyOutput(document: TimelineDocument, input: ApplyInput): void
@@ -2392,7 +2428,7 @@ Cover:
 - A returned task list replaces the ledger (tasks not returned are removed).
 - New chapter: assigns `ch_<uuid>`, `createdAt`/`updatedAt` = now, `startedAt` = earliest highlight, `endedAt` = latest highlight.
 - Extend with the last chapter ID appends highlights and updates title/summary when non-empty.
-- Extend with a stale/unknown chapter ID is treated as a new chapter.
+- Extend with a stale/unknown chapter ID is treated as a new chapter and logs a warning when the optional logger is present.
 - Extend never moves `startedAt` backward; `endedAt` takes the max.
 - A highlight with duplicate normalized text in the same chapter is dropped.
 - A highlight's `at` comes from the resolved anchor, never from the model.
@@ -2422,13 +2458,15 @@ export interface ApplyInput {
   coveragePartial: boolean
   model: TimelineModelRef
   promptVersion: number
+  /** Optional engine logger; logs IDs only, never prompt or message content. */
+  log?: (message: string, data?: Record<string, unknown>) => void | undefined
 }
 
 export function applyOutput(document: TimelineDocument, input: ApplyInput): void {
   if (input.output.goal) document.goal = input.output.goal
   if (input.output.tasks !== null) document.tasks = reconcileTasks(document.tasks, input.output.tasks, input.now)
 
-  for (const chapter of input.output.chapters) applyChapter(document, chapter, input.now)
+  for (const chapter of input.output.chapters) applyChapter(document, chapter, input)
 
   if (input.coveragePartial) {
     document.coverage.partial = true
@@ -2470,11 +2508,21 @@ function reconcileTasks(existing: readonly TimelineTask[], incoming: readonly Va
   return result
 }
 
-function applyChapter(document: TimelineDocument, incoming: ValidatedChapter, now: string): void {
+function applyChapter(document: TimelineDocument, incoming: ValidatedChapter, input: ApplyInput): void {
+  const now = input.now
   const highlights = incoming.highlights.map(toHighlight).filter((highlight): highlight is TimelineHighlight => Boolean(highlight))
   if (highlights.length === 0) return
 
   const last = document.chapters[document.chapters.length - 1]
+  if (incoming.mode === "extend" && last && incoming.chapterID !== last.id) {
+    // Spec §7.2: log the stale extend; history is never rewritten. Session and
+    // chapter IDs only — never highlight text or message content.
+    input.log?.("extend targeted a non-current chapter; treated as new", {
+      sessionID: document.sessionID,
+      requestedChapterID: incoming.chapterID,
+      currentChapterID: last.id,
+    })
+  }
   if (incoming.mode === "extend" && last && incoming.chapterID === last.id) {
     const existingText = new Set(last.highlights.map((highlight) => normalizeText(highlight.text)))
     const appended = highlights.filter((highlight) => {
@@ -3118,6 +3166,7 @@ private async refreshOnce(
       coveragePartial: read.partial,
       model: this.deps.config.model!,
       promptVersion: PROMPT_VERSION,
+      log: this.log,
     })
     this.advanceWatermark(document, last, read.messages.length)
     document.status = "ready"
@@ -3518,7 +3567,10 @@ export class FakeClock implements Clock {
       this.timers.delete(id)
       this.time = timer.at
       timer.callback()
-      await Promise.resolve()
+      // A single microtask tick is not enough: scheduler callbacks drive async
+      // chains (store loads, model calls, persist). Drain a bounded number of
+      // microtasks so awaits inside the chain settle before the next timer.
+      for (let tick = 0; tick < 32; tick += 1) await Promise.resolve()
     }
     this.time = target
   }
@@ -3663,7 +3715,7 @@ async backfill(
   const target = document ?? this.newDocument(info)
   const started = this.startTask(
     sessionID,
-    () => this.runBackfill(sessionID, info, target, messages, read.partial),
+    () => this.runBackfill(sessionID, info, target, messages, read.partial, read.messages.length),
     // Catch up on messages that arrived during the backfill in exactly one
     // forced pass; a threshold-skipped "open" refresh would leave them
     // pending until the next idle event.
@@ -3714,6 +3766,10 @@ private async runBackfill(
   document: TimelineDocument,
   messages: readonly SessionMessageInfo[],
   partial: boolean,
+  // `TimelineWatermark.messageCount` is a diagnostic (spec §5.1): the transcript
+  // length of the read that produced this snapshot — never the cumulative
+  // backfill total across resumes.
+  contextLength: number,
 ): Promise<void> {
   const runtime = this.runtime(sessionID)
   runtime.backfill = { cancelled: false }
@@ -3750,7 +3806,7 @@ private async runBackfill(
     if (!last) continue
 
     if (digest.includedCount === 0) {
-      this.advanceWatermark(document, last, backfill.totalMessages)
+      this.advanceWatermark(document, last, contextLength)
       processed += chunk.length
       backfill.processedMessages = processed
       await this.persist(sessionID, document)
@@ -3797,8 +3853,9 @@ private async runBackfill(
       coveragePartial: partial,
       model: this.deps.config.model!,
       promptVersion: PROMPT_VERSION,
+      log: this.log,
     })
-    this.advanceWatermark(document, last, backfill.totalMessages)
+    this.advanceWatermark(document, last, contextLength)
     processed += chunk.length
     backfill.processedMessages = processed
     document.status = "backfilling"
@@ -3884,7 +3941,7 @@ async rebuild(
   const document = this.newDocument(info)
   const started = this.startTask(
     sessionID,
-    () => this.runBackfill(sessionID, info, document, read.messages, read.partial),
+    () => this.runBackfill(sessionID, info, document, read.messages, read.partial, read.messages.length),
     // Catch up on messages that arrived during the backfill in exactly one
     // forced pass; a threshold-skipped "open" refresh would leave them
     // pending until the next idle event.
@@ -3952,6 +4009,22 @@ if (due && document.status !== "error") {
     void this.refresh(sessionID, "open").catch((error) => {
       this.log("open refresh failed", { sessionID, error: sanitizeError(error) })
     })
+    return { document, busy: runtime.running !== null, needsBackfill: false }
+  }
+  // A rewritten (non-partial) transcript surfaces on open, not at the next
+  // idle event. A partial (compacted) read keeps the document untouched; the
+  // idle path finalizes or falls back to the timestamp slice.
+  if (slice.kind === "history-changed" && !read.partial) {
+    const now = this.nowIso()
+    document.status = "stale"
+    document.meta.lastCheckedAt = now
+    document.meta.notice = {
+      kind: "history-changed",
+      message: "The transcript changed. Rebuild the timeline to continue.",
+      at: now,
+    }
+    await this.persist(sessionID, document)
+    this.emitUpdated(document)
   }
 }
 return { document, busy: runtime.running !== null, needsBackfill: false }
@@ -5136,26 +5209,36 @@ export function createTimelineState(context: Context, sessionID: string): Timeli
     },
     { signal: controller.signal },
   )
+  // Spec §10.2: refetch on `updated`, on `error`, and on `progress` when the
+  // chapter count changes. The local progress signal renders live progress; a
+  // chapter-count change also refetches so the timeline grows immediately.
+  let lastProgressChapters: number | undefined
   const offProgress = rpc.events.on(
     "progress",
     (event) => {
       if (!isRecord(event.data) || event.data.sessionID !== sessionID) return
       const phase = event.data.phase
       if (phase !== "backfill" && phase !== "update") return
+      const chapters = numberOrZero(event.data.chapters)
       setProgress({
         phase,
         processed: numberOrZero(event.data.processed),
         total: numberOrZero(event.data.total),
-        chapters: numberOrZero(event.data.chapters),
+        chapters,
       })
+      if (lastProgressChapters !== undefined && chapters !== lastProgressChapters) void load()
+      lastProgressChapters = chapters
     },
     { signal: controller.signal },
   )
+  // Spec §10.2: an `error` event is a background-refresh failure; it refetches
+  // `ensure` — the envelope `error` renders in doc-error state — not a
+  // `requestError`. `requestError` is reserved for failures of our own calls.
   const offError = rpc.events.on(
     "error",
     (event) => {
       if (!isRecord(event.data) || event.data.sessionID !== sessionID) return
-      if (typeof event.data.message === "string") setRequestError(event.data.message)
+      void load()
     },
     { signal: controller.signal },
   )
@@ -5546,6 +5629,8 @@ export function panelInput(overrides: Partial<PanelInput> = {}): PanelInput {
 - `backfill(true)` returns `started` and reloads.
 - `cancel()` calls `cancel`.
 - An `updated` event for this session triggers `ensure`; an event for another session does not.
+- An `error` event for this session refetches `ensure` instead of setting `requestError`.
+- A `progress` event updates the local progress signal, and a chapter-count change refetches `ensure`.
 - `excerpt()` filters malformed items.
 
 `test/tui-commands.test.ts`:
@@ -5600,7 +5685,11 @@ test("host runtime matcher allows type-only imports", () => {
 
 test("host runtime imports appear only in .tsx sources", () => {
   const violations: string[] = []
-  for (const path of sourceFiles(resolve(root, "src"))) {
+  // root-level entry files join the scan: `index.ts` exists from Task 1, and
+  // `rpc.ts` arrives in Task 20 — scan both so the rule keeps covering them.
+  const paths = [sourceFiles(resolve(root, "src")), resolve(root, "index.ts"), resolve(root, "rpc.ts")].flat()
+  for (const path of paths) {
+    if (!existsSync(path)) continue
     for (const [index, line] of readFileSync(path, "utf8").split("\n").entries()) {
       const specifier = hostRuntimeImport(line)
       if (specifier) violations.push(`${relative(root, path)}:${index + 1}: ${specifier}`)
@@ -6231,7 +6320,7 @@ never call `ensure`. Render the states in this order:
 1. **Child:** "Recap is available for root sessions."
 2. **Disabled:** `state.disabledReason()` plus `CONFIG_SNIPPET`.
 3. **Loading:** "Loading recap…"
-4. **Transport error:** `state.requestError()` with "r to retry".
+4. **Transport error:** `state.requestError()` is set only when one of our own calls fails — RPC `error` events never produce it (`state` refetches `ensure` on them, Task 17). When a document with chapters exists, keep the ready body and show the transport error as a banner above the header; only replace the whole body with the error message + "r to retry" when nothing is renderable.
 5. **Document null / watermark null / needsBackfill:**
    - If `state.busy()` and `document()` is null: "Building recap…" + "x to cancel". `ensure` can auto-start a backfill before the first document write lands.
    - If `document()` exists and `document()!.status === "error"`: use `state.error()?.message ?? document()!.meta.lastError?.message ?? "Recap update failed"` + "b to resume/rebuild" + "r to retry". Check this before the generic build prompt so a failed backfill shows its error.
@@ -6273,6 +6362,8 @@ Cover each state:
 - **Hourly cap notice:** banner text; `r` calls `refresh`.
 - **History changed notice:** banner text; `r` shows a toast and does **not** call `refresh`; `b` calls `rebuild(false)` rather than `backfill`.
 - **Error:** message + `r` retries.
+- **Transport error with a renderable document:** the banner appears above the header, the timeline stays visible, and `r` retries; a transport error with nothing renderable replaces the body.
+- **RPC `error` event:** the state refetches `ensure` (doc-error state surfaced by the envelope); `requestError` is not set.
 - **Disabled:** reason + config snippet; no RPC model calls.
 - **Child:** root-only message; no `ensure` call.
 
