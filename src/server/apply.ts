@@ -10,6 +10,8 @@ import type {
 import type { ValidatedChapter, ValidatedHighlight, ValidatedOutput, ValidatedTask } from "./output.js"
 import { normalizeText, slugify } from "./text.js"
 
+const CHAPTER_ID_PATTERN = /^ch_[A-Za-z0-9-]{1,64}$/
+
 export interface ApplyInput {
   output: ValidatedOutput
   now: string
@@ -30,7 +32,7 @@ export function applyOutput(document: TimelineDocument, input: ApplyInput): void
     document.coverage.partial = true
     document.coverage.reason = "compacted-history"
   }
-  document.meta.model = input.model
+  document.meta.model = { ...input.model }
   document.meta.promptVersion = input.promptVersion
 }
 
@@ -80,10 +82,11 @@ function applyChapter(document: TimelineDocument, incoming: ValidatedChapter, in
   const last = document.chapters[document.chapters.length - 1]
   if (incoming.mode === "extend" && last && incoming.chapterID !== last.id) {
     // Spec §7.2: log the stale extend; history is never rewritten. Session and
-    // chapter IDs only — never highlight text or message content.
+    // chapter IDs only — never highlight text or message content. Chapter IDs
+    // are model-controlled, so only the generated shape is logged verbatim.
     input.log?.("extend targeted a non-current chapter; treated as new", {
       sessionID: document.sessionID,
-      requestedChapterID: incoming.chapterID,
+      ...chapterIDLogFields(incoming.chapterID),
       currentChapterID: last.id,
     })
   }
@@ -124,8 +127,19 @@ function dedupeHighlights(highlights: readonly TimelineHighlight[], seen = new S
   })
 }
 
+function chapterIDLogFields(chapterID: string | undefined): {
+  requestedChapterID?: string
+  requestedChapterIDMalformed?: true
+} {
+  if (chapterID === undefined) return {}
+  return CHAPTER_ID_PATTERN.test(chapterID) ? { requestedChapterID: chapterID } : { requestedChapterIDMalformed: true }
+}
+
 function toHighlight(highlight: ValidatedHighlight): TimelineHighlight | undefined {
   if (!highlight.anchorMessageID || !highlight.text) return undefined
+  // Directly constructed validated output bypasses `parseModelOutput`; an
+  // unparsable timestamp must never poison the chapter bounds.
+  if (!Number.isFinite(Date.parse(highlight.at))) return undefined
   const artifact = toArtifact(highlight.artifact)
   return {
     id: `hl_${randomUUID()}`,
@@ -133,7 +147,7 @@ function toHighlight(highlight: ValidatedHighlight): TimelineHighlight | undefin
     text: highlight.text,
     at: highlight.at,
     anchorMessageID: highlight.anchorMessageID,
-    ...(highlight.task ? { task: highlight.task } : {}),
+    ...(highlight.task ? { task: { ...highlight.task } } : {}),
     ...(artifact ? { artifact } : {}),
   }
 }
@@ -146,7 +160,8 @@ function toArtifact(artifact: ValidatedHighlight["artifact"]): TimelineHighlight
   if (artifact.type === "commit") {
     return { type: "commit", ...(artifact.url ? { url: artifact.url } : {}) }
   }
-  return artifact
+  // The document owns its highlights; never keep the caller's reference.
+  return { ...artifact }
 }
 
 function earliest(...values: string[]): string {

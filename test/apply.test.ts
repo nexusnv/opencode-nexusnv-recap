@@ -427,6 +427,81 @@ describe("applyOutput chapters", () => {
     expect(JSON.stringify(logs)).not.toContain("New work")
   })
 
+  test("never logs a malformed model-controlled chapter ID", () => {
+    const existing = chapter({ id: "ch_current" })
+    const document = documentWith({ chapters: [existing] })
+    const logs: Array<{ message: string; data?: Record<string, unknown> }> = []
+    const malformed = `ch_secret\nTOKEN\n${"x".repeat(500)}`
+
+    apply(
+      document,
+      output({
+        chapters: [
+          validatedChapter({
+            mode: "extend",
+            chapterID: malformed,
+            title: "Malformed extend",
+            highlights: [validatedHighlight({ text: "New work", at: LATER })],
+          }),
+        ],
+      }),
+      {
+        log: (message, data) => {
+          logs.push({ message, ...(data ? { data } : {}) })
+        },
+      },
+    )
+
+    expect(document.chapters).toHaveLength(2)
+    const added = chapterAt(document, 1)
+    expect(added.id).not.toBe(malformed)
+    expect(UUID.test(added.id.slice(3))).toBe(true)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]?.data).toStrictEqual({
+      sessionID: "ses_1",
+      requestedChapterIDMalformed: true,
+      currentChapterID: "ch_current",
+    })
+    expect(JSON.stringify(logs)).not.toContain("secret")
+    expect(JSON.stringify(logs)).not.toContain("TOKEN")
+    expect(JSON.stringify(logs)).not.toContain("x".repeat(65))
+  })
+
+  test("treats an extend as a new chapter when the document has no chapters", () => {
+    const document = documentWith()
+    const messages: string[] = []
+
+    apply(
+      document,
+      output({
+        chapters: [
+          validatedChapter({
+            mode: "extend",
+            chapterID: "ch_missing",
+            title: "Extend without history",
+            highlights: [validatedHighlight({ text: "First highlight", at: DOC_TIME })],
+          }),
+          validatedChapter({
+            title: "Second chapter",
+            highlights: [validatedHighlight({ text: "Second highlight", at: LATER, anchorMessageID: "msg_2" })],
+          }),
+        ],
+      }),
+      {
+        log: (message) => {
+          messages.push(message)
+        },
+      },
+    )
+
+    expect(document.chapters).toHaveLength(2)
+    expect(chapterAt(document, 0).title).toBe("Extend without history")
+    expect(chapterAt(document, 0).id).not.toBe("ch_missing")
+    expect(UUID.test(chapterAt(document, 0).id.slice(3))).toBe(true)
+    expect(chapterAt(document, 1).title).toBe("Second chapter")
+    expect(messages).toStrictEqual([])
+  })
+
   test("never moves startedAt backward and keeps the latest endedAt", () => {
     const existing = chapter({
       id: "ch_1",
@@ -454,6 +529,67 @@ describe("applyOutput chapters", () => {
 
     const extended = chapterAt(document, 0)
     expect(extended.startedAt).toBe(DOC_TIME)
+    expect(extended.endedAt).toBe(LATER)
+  })
+
+  test("does not move endedAt backward when the current chapter ends after every appended highlight", () => {
+    const existingEnd = "2026-10-29T12:30:00.000Z"
+    const existing = chapter({
+      id: "ch_1",
+      startedAt: DOC_TIME,
+      endedAt: existingEnd,
+      highlights: [highlight({ text: "Existing highlight", at: "2026-10-29T10:05:00.000Z" })],
+    })
+    const document = documentWith({ chapters: [existing] })
+
+    apply(
+      document,
+      output({
+        chapters: [
+          validatedChapter({
+            mode: "extend",
+            chapterID: "ch_1",
+            highlights: [
+              validatedHighlight({ text: "Older highlight", at: EARLIER }),
+              validatedHighlight({ text: "Newer highlight", at: LATER }),
+            ],
+          }),
+        ],
+      }),
+    )
+
+    const extended = chapterAt(document, 0)
+    expect(extended.startedAt).toBe(DOC_TIME)
+    expect(extended.endedAt).toBe(existingEnd)
+  })
+
+  test("drops a highlight with an unparsable timestamp and keeps its valid siblings", () => {
+    const existing = chapter({
+      id: "ch_1",
+      endedAt: "2026-10-29T10:10:00.000Z",
+      highlights: [highlight({ text: "Existing highlight", at: "2026-10-29T10:05:00.000Z" })],
+    })
+    const document = documentWith({ chapters: [existing] })
+
+    apply(
+      document,
+      output({
+        chapters: [
+          validatedChapter({
+            mode: "extend",
+            chapterID: "ch_1",
+            highlights: [
+              validatedHighlight({ text: "Not a date", at: "not-a-date" }),
+              validatedHighlight({ text: "Valid highlight", at: LATER }),
+            ],
+          }),
+        ],
+      }),
+    )
+
+    const extended = chapterAt(document, 0)
+    expect(extended.highlights.map((entry) => entry.text)).toStrictEqual(["Existing highlight", "Valid highlight"])
+    expect(extended.highlights.map((entry) => entry.at)).toStrictEqual(["2026-10-29T10:05:00.000Z", LATER])
     expect(extended.endedAt).toBe(LATER)
   })
 
@@ -516,7 +652,9 @@ describe("applyOutput chapters", () => {
             mode: "new",
             title: "Chapter",
             summary: "Summary",
-            highlights: [{ kind: "implementation", text: "Anchored highlight", anchor: "m1" }],
+            highlights: [
+              { kind: "implementation", text: "Anchored highlight", anchor: "m1", at: "1999-01-01T00:00:00.000Z" },
+            ],
           },
         ],
       }),
@@ -601,6 +739,70 @@ describe("applyOutput coverage and meta", () => {
 
     expect(document.meta.model).toStrictEqual(model)
     expect(document.meta.promptVersion).toBe(3)
+  })
+
+  test("leaves the watermark to the engine on a non-empty apply", () => {
+    const watermark = { messageID: "msg_9", createdAt: DOC_TIME, messageCount: 9 }
+    const document = documentWith()
+    document.watermark = watermark
+
+    apply(
+      document,
+      output({ chapters: [validatedChapter({ highlights: [validatedHighlight({ text: "New work" })] })] }),
+    )
+
+    expect(document.chapters).toHaveLength(1)
+    expect(document.watermark).toStrictEqual(watermark)
+  })
+})
+
+describe("applyOutput document ownership", () => {
+  test("copies caller-owned model, artifact, and task objects into the document", () => {
+    const document = documentWith()
+    const model: TimelineModelRef = { providerID: "anthropic", modelID: "claude-sonnet-4-5", variant: "high" }
+    const artifact: NonNullable<ValidatedHighlight["artifact"]> = {
+      type: "pr",
+      url: "https://github.com/acme/repo/pull/42",
+      state: "merged",
+    }
+    const taskRef: NonNullable<ValidatedHighlight["task"]> = { key: "build-rpc", status: "open" }
+
+    apply(
+      document,
+      output({
+        chapters: [
+          validatedChapter({
+            highlights: [validatedHighlight({ text: "Merged a PR", artifact, task: taskRef })],
+          }),
+        ],
+      }),
+      { model },
+    )
+
+    const added = chapterAt(document, 0)
+    const stored = highlightAt(added, 0)
+    expect(document.meta.model).toStrictEqual(model)
+    expect(document.meta.model).not.toBe(model)
+    expect(stored.artifact).toStrictEqual(artifact)
+    expect(stored.artifact).not.toBe(artifact)
+    expect(stored.task).toStrictEqual(taskRef)
+    expect(stored.task).not.toBe(taskRef)
+
+    model.variant = "low"
+    artifact.state = "closed"
+    taskRef.status = "done"
+
+    expect(document.meta.model).toStrictEqual({
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+      variant: "high",
+    })
+    expect(stored.artifact).toStrictEqual({
+      type: "pr",
+      url: "https://github.com/acme/repo/pull/42",
+      state: "merged",
+    })
+    expect(stored.task).toStrictEqual({ key: "build-rpc", status: "open" })
   })
 })
 
