@@ -1,0 +1,785 @@
+import type { SessionInfo, SessionMessageInfo } from "@opencode/client"
+import type { Plugin } from "@opencode/plugin"
+import type { TimelineConfig } from "../config.js"
+import { createDocument } from "../shared/document.js"
+import type { TimelineDocument, TimelineError, TimelineEstimate } from "../shared/types.js"
+import { applyOutput } from "./apply.js"
+import { chunkMessages, estimateBackfill } from "./chunk.js"
+import { type Clock, systemClock, type TimerHandle } from "./clock.js"
+import { buildDigest, type DigestAlias } from "./digest.js"
+import {
+  InvalidOutputFailure,
+  ModelCallFailure,
+  StorageFailure,
+  TimelineFailure,
+  isNotFound,
+  sanitizeError,
+  sessionIDOf,
+  toTimelineError,
+} from "./errors.js"
+import { ModelFailure, type ModelClient } from "./model.js"
+import { parseModelOutput, type ValidatedOutput } from "./output.js"
+import { PROMPT_VERSION, buildPrompt, buildRepairPrompt } from "./prompt.js"
+import { readSessionMessages } from "./read.js"
+import type { TimelineStore } from "./store.js"
+import { isRecord } from "./text.js"
+import { sliceAfterWatermark } from "./watermark.js"
+
+export type RefreshReason = "idle" | "open" | "manual" | "force"
+
+export interface EngineEventSink {
+  updated(data: { sessionID: string; status: string; chapterCount: number; taskCount: number; updatedAt: string }): void
+  progress(data: {
+    sessionID: string
+    phase: "backfill" | "update"
+    processed: number
+    total: number
+    chapters: number
+  }): void
+  error(data: { sessionID: string; kind: string; message: string; retryable: boolean }): void
+}
+
+export interface GetResult {
+  document: TimelineDocument | null
+  busy: boolean
+  disabledReason?: string | undefined
+  error?: TimelineError | undefined
+}
+
+export interface EnsureResult extends GetResult {
+  needsBackfill: boolean
+  estimate?: TimelineEstimate | undefined
+}
+
+export interface EngineDeps {
+  readonly ctx: Pick<
+    Plugin.Context,
+    "session" | "model" | "storage" | "event" | "generate" | "experimental" | "location"
+  >
+  readonly config: TimelineConfig
+  readonly store: TimelineStore
+  readonly model: ModelClient
+  readonly clock?: Clock
+  readonly events?: EngineEventSink
+  readonly disabledReason?: string | undefined
+  readonly log?: (message: string, data?: Record<string, unknown>) => void
+}
+
+interface SessionRuntime {
+  running: Promise<void> | null
+  rerun: boolean
+  debounce?: TimerHandle | undefined
+  force?: TimerHandle | undefined
+  forceOnNextIdle: boolean
+  backfill?: { cancelled: boolean } | undefined
+  error?: TimelineError | undefined
+  progress?: { phase: "backfill" | "update"; processed: number; total: number; chapters: number } | undefined
+}
+
+export class TimelineEngine {
+  private readonly runtimeBySession = new Map<string, SessionRuntime>()
+  private readonly clock: Clock
+  private readonly log: (message: string, data?: Record<string, unknown>) => void
+  private controller: AbortController | undefined
+  private started = false
+  private stopped = false
+  private disabledReason: string | undefined
+  private inFlight = 0
+  private readonly waiters: Array<() => void> = []
+
+  constructor(private readonly deps: EngineDeps) {
+    this.clock = deps.clock ?? systemClock
+    this.log = deps.log ?? (() => undefined)
+    this.disabledReason = deps.disabledReason
+  }
+
+  private runtime(sessionID: string): SessionRuntime {
+    let runtime = this.runtimeBySession.get(sessionID)
+    if (!runtime) {
+      runtime = { running: null, rerun: false, forceOnNextIdle: false }
+      this.runtimeBySession.set(sessionID, runtime)
+    }
+    return runtime
+  }
+
+  private now(): number {
+    return this.clock.now()
+  }
+
+  private nowIso(): string {
+    return new Date(this.now()).toISOString()
+  }
+
+  async start(): Promise<void> {
+    if (this.started) return
+    this.started = true
+    await this.validateModel()
+    const controller = new AbortController()
+    this.controller = controller
+    void this.consume(controller.signal)
+  }
+
+  private async consume(signal: AbortSignal): Promise<void> {
+    try {
+      for await (const event of this.deps.ctx.event.subscribe({ signal })) {
+        try {
+          await this.handleEvent(event)
+        } catch (error) {
+          this.log("event handler failed", { error: sanitizeError(error) })
+        }
+      }
+    } catch (error) {
+      if (!signal.aborted) this.log("event stream ended", { error: sanitizeError(error) })
+    }
+  }
+
+  private async handleEvent(event: unknown): Promise<void> {
+    if (!isRecord(event) || typeof event.type !== "string") return
+    if (event.type === "session.deleted") {
+      const sessionID = sessionIDOf(event)
+      if (!sessionID) return
+      this.clearTimers(sessionID)
+      this.runtimeBySession.delete(sessionID)
+      await this.deps.store.remove(sessionID).catch(() => undefined)
+      return
+    }
+    if (event.type !== "session.idle") return
+    const sessionID = sessionIDOf(event)
+    if (!sessionID) return
+    const info = await this.deps.ctx.session.get({ sessionID }).catch(() => undefined)
+    if (!info) return
+    if (info.parentID) return
+    if (info.projectID !== this.deps.ctx.location.project.id) return
+    this.scheduleDebounce(sessionID)
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true
+    this.controller?.abort()
+    this.controller = undefined
+    for (const sessionID of this.runtimeBySession.keys()) this.clearTimers(sessionID)
+    for (const waiter of this.waiters.splice(0)) waiter()
+  }
+
+  private clearTimers(sessionID: string): void {
+    const runtime = this.runtimeBySession.get(sessionID)
+    if (!runtime) return
+    if (runtime.debounce !== undefined) this.clock.clearTimeout(runtime.debounce)
+    if (runtime.force !== undefined) this.clock.clearTimeout(runtime.force)
+    runtime.debounce = undefined
+    runtime.force = undefined
+  }
+
+  private scheduleDebounce(sessionID: string): void {
+    if (this.stopped) return
+    // A disabled engine (missing model, bad config) must not log an error on
+    // every idle event.
+    if (this.disabledReason) return
+    const runtime = this.runtime(sessionID)
+    if (runtime.debounce !== undefined) this.clock.clearTimeout(runtime.debounce)
+    runtime.debounce = this.clock.setTimeout(() => {
+      runtime.debounce = undefined
+      if (this.stopped) return
+      if (runtime.forceOnNextIdle) {
+        runtime.forceOnNextIdle = false
+        void this.refreshWithOptions(sessionID, "force", true).catch((error) => {
+          this.log("forced refresh failed", { sessionID, error: sanitizeError(error) })
+        })
+        return
+      }
+      void this.refresh(sessionID, "idle").catch((error) => {
+        this.log("idle refresh failed", { sessionID, error: sanitizeError(error) })
+      })
+    }, this.deps.config.update.debounceMs)
+  }
+
+  private scheduleForceTimer(sessionID: string, delayMs = this.deps.config.update.forceAfterMinutes * 60_000): void {
+    if (this.stopped) return
+    const runtime = this.runtime(sessionID)
+    if (runtime.force !== undefined) this.clock.clearTimeout(runtime.force)
+    runtime.force = this.clock.setTimeout(
+      () => {
+        runtime.force = undefined
+        if (this.stopped) return
+        void this.runForceTimer(sessionID).catch((error) => {
+          this.log("force timer failed", { sessionID, error: sanitizeError(error) })
+        })
+      },
+      Math.max(0, delayMs),
+    )
+  }
+
+  private async runForceTimer(sessionID: string): Promise<void> {
+    const document = await this.deps.store.load(sessionID)
+    if (!document?.watermark) return
+    const read = await readSessionMessages(this.deps.ctx, sessionID)
+    const slice = sliceAfterWatermark(read.messages, document.watermark)
+    if (slice.kind !== "new") return
+    if (await this.sessionBusy(sessionID, read.messages)) {
+      this.runtime(sessionID).forceOnNextIdle = true
+      return
+    }
+    await this.refreshWithOptions(sessionID, "force", true)
+  }
+
+  private async sessionBusy(sessionID: string, messages: readonly SessionMessageInfo[]): Promise<boolean> {
+    const last = messages[messages.length - 1]
+    if (!last) return false
+    const info = await this.deps.ctx.session.get({ sessionID }).catch(() => undefined)
+    if (info?.time.idle !== undefined && info.time.idle < last.time.created) return true
+    if (last.type === "user") return true
+    if (last.type === "assistant") {
+      if (last.time.completed === undefined) return true
+      if (
+        last.content.some(
+          (part) => part.type === "tool" && (part.state.status === "running" || part.state.status === "streaming"),
+        )
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  async refresh(
+    sessionID: string,
+    reason: RefreshReason = "manual",
+  ): Promise<{ started: boolean; coalesced: boolean }> {
+    return this.refreshWithOptions(sessionID, reason, reason === "manual")
+  }
+
+  private async refreshWithOptions(
+    sessionID: string,
+    reason: RefreshReason,
+    force: boolean,
+  ): Promise<{ started: boolean; coalesced: boolean }> {
+    const manual = reason === "manual"
+    if (manual) this.assertEnabled()
+    else if (this.disabledReason) return { started: false, coalesced: false }
+
+    const info = await this.resolveSession(sessionID)
+    const document = await this.deps.store.load(sessionID)
+    if (!document?.watermark) {
+      if (manual) throw new TimelineFailure("invalid_request", "Build the timeline first.")
+      return { started: false, coalesced: false }
+    }
+    if (document.backfill && document.backfill.completedAt === undefined) {
+      if (manual) throw new TimelineFailure("invalid_request", "Resume the backfill before refreshing.")
+      return { started: false, coalesced: false }
+    }
+    if (document.meta.notice?.kind === "history-changed") {
+      if (manual) throw new TimelineFailure("invalid_request", "The transcript changed; rebuild is required.")
+      return { started: false, coalesced: false }
+    }
+    return this.startTask(sessionID, () => this.refreshOnce(sessionID, info, reason, force))
+  }
+
+  private async refreshOnce(
+    sessionID: string,
+    info: SessionInfo,
+    reason: RefreshReason,
+    force: boolean,
+  ): Promise<void> {
+    const document = await this.deps.store.load(sessionID)
+    if (!document?.watermark) return
+    if (document.backfill && document.backfill.completedAt === undefined) return
+    if (document.meta.notice?.kind === "history-changed") return
+    document.sessionTitle = info.title ?? document.sessionTitle
+
+    const read = await readSessionMessages(this.deps.ctx, sessionID)
+    const slice = sliceAfterWatermark(read.messages, document.watermark)
+    const now = this.nowIso()
+
+    if (slice.kind === "history-changed") {
+      // A compacted transcript can drop the watermark message without rewinding
+      // history. The existing chapters still describe what was processed, and the
+      // next post-compaction message will resume from the timestamp fallback.
+      // Only a missing watermark in a non-partial read means the transcript was
+      // rewound or replaced.
+      if (read.partial) {
+        document.meta.lastCheckedAt = now
+        await this.persist(sessionID, document)
+        this.emitUpdated(document)
+        return
+      }
+      document.status = "stale"
+      document.meta.lastCheckedAt = now
+      document.meta.notice = {
+        kind: "history-changed",
+        message: "The transcript changed. Rebuild the timeline to continue.",
+        at: now,
+      }
+      await this.persist(sessionID, document)
+      this.emitUpdated(document)
+      return
+    }
+
+    if (slice.kind === "empty") {
+      document.status = "ready"
+      document.meta.lastCheckedAt = now
+      delete document.meta.notice
+      delete document.meta.lastError
+      await this.persist(sessionID, document)
+      this.emitUpdated(document)
+      return
+    }
+
+    if (reason === "idle" && !force && this.belowThreshold(slice.messages)) {
+      document.status = "stale"
+      document.meta.lastCheckedAt = now
+      await this.persist(sessionID, document)
+      this.emitUpdated(document)
+      const oldest = slice.messages[0]
+      const age = oldest ? this.now() - oldest.time.created : 0
+      const remaining = this.deps.config.update.forceAfterMinutes * 60_000 - age
+      this.scheduleForceTimer(sessionID, remaining)
+      return
+    }
+
+    const automatic = reason !== "manual"
+    if (automatic && this.overHourlyCap(document)) {
+      document.status = "stale"
+      document.meta.lastCheckedAt = now
+      document.meta.notice = {
+        kind: "hourly-cap",
+        message: "Automatic updates paused for this session. Press r to refresh now.",
+        at: now,
+      }
+      await this.persist(sessionID, document)
+      this.emitUpdated(document)
+      return
+    }
+
+    if (reason === "manual") {
+      delete document.meta.notice
+      document.meta.lastCheckedAt = now
+    }
+
+    const chunks = chunkMessages(slice.messages, this.deps.config)
+    let processed = 0
+    for (const chunk of chunks) {
+      if (this.stopped) return
+      processed += chunk.length
+      const digest = buildDigest(chunk, this.deps.config)
+      const last = chunk[chunk.length - 1]
+      if (!last) continue
+
+      if (digest.includedCount === 0) {
+        const previousWatermark = document.watermark
+        this.advanceWatermark(document, last, read.messages.length)
+        document.status = "ready"
+        try {
+          await this.persist(sessionID, document)
+        } catch (error) {
+          // A shared in-memory store may still reference this document. Never
+          // leave it pointing past a chunk that was not durably saved.
+          document.watermark = previousWatermark
+          throw error
+        }
+        this.emitProgress(sessionID, "update", processed, slice.messages.length, document.chapters.length)
+        continue
+      }
+
+      const prompt = buildPrompt({
+        document,
+        digest: digest.text,
+        evidence: digest.evidence,
+        config: this.deps.config,
+      })
+
+      let result: { output: ValidatedOutput; calls: number; chars: number }
+      try {
+        result = await this.callModel(prompt, digest.aliasMap)
+      } catch (error) {
+        if (this.stopped) return
+        await this.handleModelFailure(sessionID, document, error, prompt.length, automatic, 1)
+        return
+      }
+
+      // A stop can land while the model call is in flight. Never apply a late
+      // result to the persisted document.
+      if (this.stopped) return
+
+      applyOutput(document, {
+        output: result.output,
+        now: this.nowIso(),
+        coveragePartial: read.partial,
+        model: this.deps.config.model!,
+        promptVersion: PROMPT_VERSION,
+        log: this.log,
+      })
+      const previousWatermark = document.watermark
+      this.advanceWatermark(document, last, read.messages.length)
+      document.status = "ready"
+      document.meta.lastCheckedAt = this.nowIso()
+      delete document.meta.notice
+      delete document.meta.lastError
+      this.recordCalls(document, result.chars, automatic, result.calls)
+      try {
+        await this.persist(sessionID, document)
+      } catch (error) {
+        document.watermark = previousWatermark
+        throw error
+      }
+      this.emitProgress(sessionID, "update", processed, slice.messages.length, document.chapters.length)
+    }
+
+    this.emitUpdated(document)
+  }
+
+  private async callModel(
+    prompt: string,
+    aliases: ReadonlyMap<string, DigestAlias>,
+  ): Promise<{ output: ValidatedOutput; calls: number; chars: number }> {
+    await this.acquire()
+    let calls = 1
+    let chars = prompt.length
+    try {
+      if (this.stopped) throw new ModelFailure("Engine stopped", "aborted", false)
+      let first: string
+      try {
+        first = await this.deps.model.complete(prompt, this.controller?.signal)
+      } catch (error) {
+        throw new ModelCallFailure(error, calls, chars)
+      }
+      const parsed = parseModelOutput(first, aliases)
+      if (parsed.ok) return { output: parsed.output, calls, chars }
+
+      const repair = buildRepairPrompt(prompt, parsed.error, first)
+      calls = 2
+      chars = prompt.length + repair.length
+      let second: string
+      try {
+        second = await this.deps.model.complete(repair, this.controller?.signal)
+      } catch (error) {
+        throw new ModelCallFailure(error, calls, chars)
+      }
+      const repaired = parseModelOutput(second, aliases)
+      if (!repaired.ok) throw new ModelCallFailure(new InvalidOutputFailure(repaired.error), calls, chars)
+      return { output: repaired.output, calls, chars }
+    } finally {
+      this.release()
+    }
+  }
+
+  private async handleModelFailure(
+    sessionID: string,
+    document: TimelineDocument,
+    error: unknown,
+    promptChars: number,
+    automatic: boolean,
+    calls: number,
+  ): Promise<void> {
+    const now = this.nowIso()
+    const failure = toTimelineError(error, now)
+    const callCount = error instanceof ModelCallFailure ? error.calls : calls
+    const charCount = error instanceof ModelCallFailure ? error.chars : promptChars
+    this.recordCalls(document, charCount, automatic, callCount)
+    const cause = error instanceof ModelCallFailure ? error.cause : error
+    if (cause instanceof ModelFailure && (cause.kind === "auth" || cause.kind === "config")) {
+      this.disabledReason = cause.message
+    }
+    document.status = "error"
+    document.meta.lastCheckedAt = now
+    document.meta.lastError = failure
+    await this.persist(sessionID, document)
+    this.emitUpdated(document)
+    this.emitError(sessionID, failure)
+  }
+
+  private advanceWatermark(document: TimelineDocument, message: SessionMessageInfo, messageCount: number): void {
+    document.watermark = {
+      messageID: message.id,
+      createdAt: new Date(message.time.created).toISOString(),
+      messageCount,
+    }
+  }
+
+  private belowThreshold(messages: readonly SessionMessageInfo[]): boolean {
+    const newUsers = messages.filter((message) => message.type === "user").length
+    const oldest = messages[0]
+    const age = oldest ? this.now() - oldest.time.created : 0
+    return (
+      newUsers < this.deps.config.update.minNewUserTurns &&
+      messages.length < this.deps.config.update.minNewMessages &&
+      age < this.deps.config.update.forceAfterMinutes * 60_000
+    )
+  }
+
+  private overHourlyCap(document: TimelineDocument): boolean {
+    const cutoff = this.now() - 3_600_000
+    const recent = document.meta.recentAutoCalls.filter((value) => Date.parse(value) >= cutoff)
+    return recent.length >= this.deps.config.limits.maxUpdatesPerHour
+  }
+
+  private recordCalls(document: TimelineDocument, chars: number, automatic: boolean, calls: number): void {
+    document.meta.callCount += calls
+    document.meta.estimatedInputChars += chars
+    if (automatic) {
+      for (let index = 0; index < calls; index += 1) {
+        document.meta.recentAutoCalls.push(this.nowIso())
+      }
+    }
+    const cutoff = this.now() - 3_600_000
+    document.meta.recentAutoCalls = document.meta.recentAutoCalls.filter((value) => Date.parse(value) >= cutoff)
+  }
+
+  private async persist(sessionID: string, document: TimelineDocument): Promise<void> {
+    try {
+      await this.deps.store.save(document, this.nowIso())
+      const runtime = this.runtime(sessionID)
+      delete runtime.error
+    } catch (error) {
+      const failure: TimelineError = {
+        message: sanitizeError(error),
+        at: this.nowIso(),
+        retryable: true,
+        kind: "storage",
+      }
+      this.runtime(sessionID).error = failure
+      // Abort the current run. Continuing would advance the in-memory watermark
+      // past a chunk that was never durably saved, losing that chunk on retry.
+      // The task loop reports the failure once; direct callers see the throw.
+      throw new StorageFailure(failure.message)
+    }
+  }
+
+  private emitUpdated(document: TimelineDocument): void {
+    this.deps.events?.updated({
+      sessionID: document.sessionID,
+      status: document.status,
+      chapterCount: document.chapters.length,
+      taskCount: document.tasks.length,
+      updatedAt: document.meta.updatedAt,
+    })
+  }
+
+  private emitProgress(
+    sessionID: string,
+    phase: "backfill" | "update",
+    processed: number,
+    total: number,
+    chapters: number,
+  ): void {
+    this.deps.events?.progress({ sessionID, phase, processed, total, chapters })
+  }
+
+  private emitError(sessionID: string, error: TimelineError): void {
+    this.deps.events?.error({
+      sessionID,
+      kind: error.kind,
+      message: error.message,
+      retryable: error.retryable,
+    })
+  }
+
+  private async resolveSession(sessionID: string): Promise<SessionInfo> {
+    let info: SessionInfo
+    try {
+      info = await this.deps.ctx.session.get({ sessionID })
+    } catch (error) {
+      if (isNotFound(error)) {
+        await this.deps.store.remove(sessionID).catch(() => undefined)
+        throw new TimelineFailure("session_not_found", `Session not found: ${sessionID}`, {
+          sessionID,
+        })
+      }
+      // A transport or host failure is not a missing session; keep the
+      // distinction so the panel can offer a retry instead of a dead end.
+      throw new TimelineFailure("internal", sanitizeError(error))
+    }
+    if (info.projectID !== this.deps.ctx.location.project.id) {
+      throw new TimelineFailure("session_not_found", `Session not found: ${sessionID}`, { sessionID })
+    }
+    if (info.parentID) {
+      throw new TimelineFailure("invalid_request", "Recap is available for root sessions only.", {
+        sessionID,
+      })
+    }
+    return info
+  }
+
+  /** Public session guard for service methods that do not run a refresh. */
+  resolve(sessionID: string): Promise<SessionInfo> {
+    return this.resolveSession(sessionID)
+  }
+
+  private assertEnabled(): void {
+    if (this.disabledReason) throw new TimelineFailure("disabled", this.disabledReason)
+  }
+
+  private async validateModel(): Promise<void> {
+    if (this.disabledReason) return
+    if (!this.deps.config.enabled) {
+      this.disabledReason = "Recap is disabled."
+      return
+    }
+    const model = this.deps.config.model
+    if (!model) {
+      this.disabledReason = "Recap requires an explicit `model`."
+      return
+    }
+    try {
+      const listed: unknown = await this.deps.ctx.model.list()
+      const models = Array.isArray(listed) ? listed : isRecord(listed) && Array.isArray(listed.data) ? listed.data : []
+      const found = models.some(
+        (entry) =>
+          isRecord(entry) &&
+          entry.providerID === model.providerID &&
+          entry.modelID === model.modelID &&
+          entry.enabled !== false,
+      )
+      if (!found) {
+        this.disabledReason = `Configured model ${model.providerID}/${model.modelID} is not available. Update the plugin options.`
+      }
+    } catch {
+      // The model list is advisory. If it is unavailable, defer the real check
+      // to the first generate call, which reports auth/config failures.
+      this.log("model list unavailable; deferring model validation")
+    }
+  }
+
+  private async acquire(): Promise<void> {
+    const limit = this.deps.config.limits.maxConcurrentCalls
+    // Re-check after every wakeup: release() decrements before waking a waiter,
+    // so a fresh acquire can take the slot first.
+    while (this.inFlight >= limit) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve))
+    }
+    this.inFlight += 1
+  }
+
+  private release(): void {
+    this.inFlight = Math.max(0, this.inFlight - 1)
+    this.waiters.shift()?.()
+  }
+
+  private startTask(
+    sessionID: string,
+    task: () => Promise<void>,
+    followUp?: () => Promise<void>,
+  ): { started: boolean; coalesced: boolean } {
+    const runtime = this.runtime(sessionID)
+    if (runtime.running) {
+      runtime.rerun = true
+      return { started: false, coalesced: true }
+    }
+    runtime.running = (async () => {
+      let current = task
+      try {
+        for (;;) {
+          runtime.rerun = false
+          await current()
+          if (!runtime.rerun || this.stopped) break
+          current = followUp ?? task
+        }
+      } catch (error) {
+        const failure = toTimelineError(error, this.nowIso())
+        runtime.error = failure
+        this.emitError(sessionID, failure)
+      } finally {
+        runtime.running = null
+        runtime.progress = undefined
+      }
+    })()
+    return { started: true, coalesced: false }
+  }
+
+  async waitForIdle(sessionID: string): Promise<void> {
+    for (;;) {
+      const runtime = this.runtimeBySession.get(sessionID)
+      if (!runtime?.running) return
+      await runtime.running
+    }
+  }
+
+  async get(sessionID: string): Promise<GetResult> {
+    await this.resolveSession(sessionID)
+    const document = await this.recoverInterrupted(sessionID)
+    const runtime = this.runtime(sessionID)
+    return {
+      document,
+      busy: runtime.running !== null,
+      ...(this.disabledReason ? { disabledReason: this.disabledReason } : {}),
+      ...(runtime.error ? { error: runtime.error } : {}),
+    }
+  }
+
+  async ensure(sessionID: string): Promise<EnsureResult> {
+    await this.resolveSession(sessionID)
+    const document = await this.recoverInterrupted(sessionID)
+    const runtime = this.runtime(sessionID)
+    if (this.disabledReason) {
+      return {
+        document,
+        busy: runtime.running !== null,
+        disabledReason: this.disabledReason,
+        needsBackfill: false,
+      }
+    }
+    // The panel calls `ensure` right after starting a build. Do not treat that
+    // in-flight job as a fresh auto-start opportunity (it would throw "busy").
+    // A normal incremental update keeps the current document visible as ready;
+    // only a backfill needs the blocking progress state.
+    if (runtime.running) {
+      return { document, busy: runtime.backfill !== undefined, needsBackfill: false }
+    }
+    if (!document) {
+      const read = await readSessionMessages(this.deps.ctx, sessionID)
+      if (read.messages.length === 0) {
+        const info = await this.resolveSession(sessionID)
+        const created = createDocument({
+          sessionID,
+          sessionTitle: info.title ?? null,
+          model: this.deps.config.model!,
+          promptVersion: PROMPT_VERSION,
+          now: this.nowIso(),
+        })
+        await this.persist(sessionID, created)
+        return { document: created, busy: false, needsBackfill: false }
+      }
+      const estimate = estimateBackfill(read.messages, this.deps.config)
+      if (estimate.approxCalls <= this.deps.config.backfill.confirmOverCalls) {
+        const started = await this.backfill(sessionID, true)
+        return {
+          document: (await this.deps.store.load(sessionID)) ?? null,
+          busy: started.started,
+          needsBackfill: false,
+        }
+      }
+      return { document: null, busy: false, needsBackfill: true, estimate }
+    }
+    if (document.watermark === null) {
+      const read = await readSessionMessages(this.deps.ctx, sessionID)
+      const estimate = estimateBackfill(read.messages, this.deps.config)
+      if (read.messages.length === 0) {
+        return { document, busy: false, needsBackfill: false }
+      }
+      if (!document.backfill?.cancelled && estimate.approxCalls <= this.deps.config.backfill.confirmOverCalls) {
+        const started = await this.backfill(sessionID, true)
+        return {
+          document: (await this.deps.store.load(sessionID)) ?? document,
+          busy: started.started,
+          needsBackfill: false,
+        }
+      }
+      return { document, busy: false, needsBackfill: true, estimate }
+    }
+    return { document, busy: runtime.running !== null, needsBackfill: false }
+  }
+
+  private async recoverInterrupted(sessionID: string): Promise<TimelineDocument | null> {
+    const document = await this.deps.store.load(sessionID)
+    if (!document) return null
+    const runtime = this.runtime(sessionID)
+    if (document.status === "backfilling" && runtime.running === null) {
+      document.status = document.backfill?.error ? "error" : "paused"
+      await this.persist(sessionID, document)
+    }
+    return document
+  }
+
+  async backfill(_sessionID: string, _confirm = false): Promise<{ started: boolean; estimate: TimelineEstimate }> {
+    throw new TimelineFailure("invalid_request", "Backfill is not implemented yet.")
+  }
+}
