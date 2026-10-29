@@ -337,6 +337,40 @@ describe("TimelineEngine refresh control", () => {
     await h.engine.stop()
   })
 
+  test("a coalesced manual refresh keeps its own reason and force semantics", async () => {
+    const old = user(BASE_TIME - 700_000)
+    const firstUser = user(BASE_TIME - 2_000)
+    const secondUser = user(BASE_TIME - 1_000)
+    const reply = assistant(BASE_TIME + 500, { completed: BASE_TIME + 1_000 })
+    const later = user(BASE_TIME + 2_000, "manual follow up")
+    const h = createTestEngine({
+      messages: [old, firstUser, secondUser, reply],
+      outputs: [NOOP_OUTPUT, NOOP_OUTPUT],
+      document: makeDocument({ watermark: watermarkOf(old) }),
+      config: quickConfig({ update: { minNewUserTurns: 2, minNewMessages: 6 } }),
+    })
+    await h.engine.start()
+    const gate = deferred()
+    h.modelState.gate = gate.promise
+
+    await h.emitIdle()
+    await h.clock.advance(1_000)
+    await h.waitFor(() => h.modelCalls.length === 1, "the gated idle model call")
+
+    h.messages.push(later)
+    expect(await h.engine.refresh(TEST_SESSION_ID, "manual")).toEqual({
+      started: false,
+      coalesced: true,
+    })
+
+    gate.resolve()
+    await finish(h)
+
+    expect(h.modelCalls).toHaveLength(2)
+    expect((await storedDocument(h)).watermark?.messageID).toBe(later.id)
+    await h.engine.stop()
+  })
+
   test("automatic refresh respects the hourly cap and manual refresh bypasses it", async () => {
     const old = user(BASE_TIME - 120_000)
     const fresh = user(BASE_TIME)
@@ -394,6 +428,29 @@ describe("TimelineEngine refresh control", () => {
     expect((await storedDocument(h)).watermark?.messageID).toBe(old.id)
   })
 
+  test("stop rejects a manual refresh without writing", async () => {
+    const old = user(BASE_TIME - 120_000)
+    const fresh = user(BASE_TIME)
+    const h = createTestEngine({
+      messages: [old, fresh],
+      outputs: [NOOP_OUTPUT],
+      document: makeDocument({ watermark: watermarkOf(old) }),
+      config: quickConfig(),
+    })
+    await h.engine.start()
+    await h.engine.stop()
+    const writes = h.storage.writes
+
+    const failure = await failureOf(h.engine.refresh(TEST_SESSION_ID, "manual"))
+    expect(failure).toBeInstanceOf(TimelineFailure)
+    expect((failure as TimelineFailure).code).toBe("internal")
+    expect((failure as Error).message).toBe("Recap is shutting down.")
+
+    await h.drain()
+    expect(h.storage.writes).toBe(writes)
+    expect((await storedDocument(h)).watermark?.messageID).toBe(old.id)
+  })
+
   test("stop ignores a model result that resolves after the engine stopped", async () => {
     const old = user(BASE_TIME - 120_000)
     const fresh = user(BASE_TIME)
@@ -420,6 +477,37 @@ describe("TimelineEngine refresh control", () => {
     expect(unchanged.chapters).toHaveLength(0)
     expect(unchanged.status).toBe("ready")
     expect(h.modelCalls[0]?.signal?.aborted).toBe(true)
+  })
+
+  test("a deleted session is not resurrected by an in-flight refresh", async () => {
+    const old = user(BASE_TIME - 120_000)
+    const fresh = user(BASE_TIME)
+    const reply = assistant(BASE_TIME + 1_000, { completed: BASE_TIME + 2_000 })
+    const h = createTestEngine({
+      messages: [old, fresh, reply],
+      outputs: [chapterOutput()],
+      document: makeDocument({ watermark: watermarkOf(old) }),
+      config: quickConfig(),
+    })
+    await h.engine.start()
+    const gate = deferred()
+    h.modelState.gate = gate.promise
+
+    void h.engine.refresh(TEST_SESSION_ID, "manual")
+    await h.waitFor(() => h.modelCalls.length === 1, "the in-flight model call")
+    await h.emitEvent({ type: "session.deleted", data: { sessionID: TEST_SESSION_ID } })
+    expect(h.storage.document(TEST_SESSION_ID)).toBeUndefined()
+
+    gate.resolve()
+    await finish(h)
+
+    expect(h.storage.document(TEST_SESSION_ID)).toBeUndefined()
+    expect(h.storage.writes).toBe(0)
+
+    const failure = await failureOf(h.engine.refresh(TEST_SESSION_ID, "manual"))
+    expect(failure).toBeInstanceOf(TimelineFailure)
+    expect((failure as TimelineFailure).code).toBe("session_not_found")
+    await h.engine.stop()
   })
 })
 
@@ -618,6 +706,43 @@ describe("TimelineEngine model output handling", () => {
     await h.engine.stop()
   })
 
+  test("an ignored-only chunk clears an old notice and error", async () => {
+    const old = user(BASE_TIME - 120_000)
+    const ignored = idleMessage(BASE_TIME)
+    const document = makeDocument({
+      watermark: watermarkOf(old),
+      now: "2026-10-29T09:00:00.000Z",
+    })
+    document.meta.notice = {
+      kind: "hourly-cap",
+      message: "Automatic updates paused for this session. Press r to refresh now.",
+      at: "2026-10-29T09:00:00.000Z",
+    }
+    document.meta.lastError = {
+      message: "provider unavailable",
+      at: "2026-10-29T09:00:00.000Z",
+      retryable: true,
+      kind: "model",
+    }
+    const h = createTestEngine({
+      messages: [old, ignored],
+      document,
+      config: quickConfig(),
+    })
+    await h.engine.start()
+
+    await h.engine.refresh(TEST_SESSION_ID, "open")
+    await finish(h)
+
+    const updated = await storedDocument(h)
+    expect(h.modelCalls).toHaveLength(0)
+    expect(updated.status).toBe("ready")
+    expect(updated.meta.notice).toBeUndefined()
+    expect(updated.meta.lastError).toBeUndefined()
+    expect(updated.meta.lastCheckedAt).toBe(new Date(h.clock.now()).toISOString())
+    await h.engine.stop()
+  })
+
   test("storage failures leave the durable watermark unchanged", async () => {
     const old = user(BASE_TIME - 120_000)
     const fresh = user(BASE_TIME)
@@ -657,6 +782,17 @@ describe("TimelineEngine availability", () => {
     await h.engine.stop()
   })
 
+  test("ensure before start reports a missing model without persisting", async () => {
+    const h = createTestEngine({ config: { model: null }, messages: [user(BASE_TIME)] })
+
+    const result = await h.engine.ensure(TEST_SESSION_ID)
+    expect(result.disabledReason).toContain("explicit `model`")
+    expect(result.document).toBeNull()
+    expect(h.storage.document(TEST_SESSION_ID)).toBeUndefined()
+    expect(h.storage.writes).toBe(0)
+    await h.engine.stop()
+  })
+
   test("start disables the engine when recap is turned off", async () => {
     const h = createTestEngine({ config: { enabled: false } })
     await h.engine.start()
@@ -676,6 +812,49 @@ describe("TimelineEngine availability", () => {
     const failure = await failureOf(h.engine.refresh(TEST_SESSION_ID, "manual"))
     expect(failure).toBeInstanceOf(TimelineFailure)
     expect((failure as TimelineFailure).code).toBe("disabled")
+    await h.engine.stop()
+  })
+
+  test("an auth failure disables the engine with a sanitized reason", async () => {
+    const old = user(BASE_TIME - 120_000)
+    const fresh = user(BASE_TIME)
+    const reply = assistant(BASE_TIME + 1_000, { completed: BASE_TIME + 2_000 })
+    const secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    const h = createTestEngine({
+      messages: [old, fresh, reply],
+      document: makeDocument({ watermark: watermarkOf(old) }),
+      modelError: new ModelFailure(`Invalid API key: ${secret}`, "auth", false),
+      config: quickConfig(),
+    })
+    await h.engine.start()
+
+    await h.engine.refresh(TEST_SESSION_ID, "manual")
+    await finish(h)
+
+    const result = await h.engine.get(TEST_SESSION_ID)
+    expect(result.disabledReason).toBeDefined()
+    expect(result.disabledReason).not.toContain(secret)
+    expect(result.disabledReason).toContain("[REDACTED]")
+    await h.engine.stop()
+  })
+
+  test("a disabled engine does not rewrite an interrupted backfill", async () => {
+    const document = makeDocument({ status: "backfilling" })
+    document.backfill = {
+      processedMessages: 1,
+      totalMessages: 2,
+      startedAt: "2026-10-29T09:00:00.000Z",
+    }
+    const h = createTestEngine({
+      config: { model: null },
+      document,
+      messages: [user(BASE_TIME)],
+    })
+
+    const result = await h.engine.ensure(TEST_SESSION_ID)
+    expect(result.document?.status).toBe("backfilling")
+    expect(h.storage.document(TEST_SESSION_ID)?.status).toBe("backfilling")
+    expect(h.storage.writes).toBe(0)
     await h.engine.stop()
   })
 })

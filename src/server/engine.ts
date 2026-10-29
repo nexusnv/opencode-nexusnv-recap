@@ -1,6 +1,6 @@
 import type { SessionInfo, SessionMessageInfo } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
-import type { TimelineConfig } from "../config.js"
+import { CONFIG_SNIPPET, type TimelineConfig } from "../config.js"
 import { createDocument } from "../shared/document.js"
 import type { TimelineDocument, TimelineError, TimelineEstimate } from "../shared/types.js"
 import { applyOutput } from "./apply.js"
@@ -26,6 +26,10 @@ import { isRecord } from "./text.js"
 import { sliceAfterWatermark } from "./watermark.js"
 
 export type RefreshReason = "idle" | "open" | "manual" | "force"
+
+const DISABLED_REASON = "Recap is disabled."
+const MISSING_MODEL_REASON = `Recap requires an explicit \`model\`.\n${CONFIG_SNIPPET}`
+const SHUTTING_DOWN_REASON = "Recap is shutting down."
 
 export interface EngineEventSink {
   updated(data: { sessionID: string; status: string; chapterCount: number; taskCount: number; updatedAt: string }): void
@@ -68,6 +72,7 @@ export interface EngineDeps {
 interface SessionRuntime {
   running: Promise<void> | null
   rerun: boolean
+  followUp?: (() => Promise<void>) | undefined
   debounce?: TimerHandle | undefined
   force?: TimerHandle | undefined
   forceOnNextIdle: boolean
@@ -78,6 +83,7 @@ interface SessionRuntime {
 
 export class TimelineEngine {
   private readonly runtimeBySession = new Map<string, SessionRuntime>()
+  private readonly deletedSessions = new Set<string>()
   private readonly clock: Clock
   private readonly log: (message: string, data?: Record<string, unknown>) => void
   private controller: AbortController | undefined
@@ -90,16 +96,32 @@ export class TimelineEngine {
   constructor(private readonly deps: EngineDeps) {
     this.clock = deps.clock ?? systemClock
     this.log = deps.log ?? (() => undefined)
-    this.disabledReason = deps.disabledReason
+    this.disabledReason =
+      deps.disabledReason ??
+      (!deps.config.enabled ? DISABLED_REASON : deps.config.model ? undefined : MISSING_MODEL_REASON)
   }
 
   private runtime(sessionID: string): SessionRuntime {
-    let runtime = this.runtimeBySession.get(sessionID)
-    if (!runtime) {
-      runtime = { running: null, rerun: false, forceOnNextIdle: false }
-      this.runtimeBySession.set(sessionID, runtime)
-    }
+    const existing = this.runtimeBySession.get(sessionID)
+    if (existing) return existing
+    // A deleted session must never get a fresh runtime entry. Callers guard
+    // before reaching here; this is the final backstop.
+    if (this.deletedSessions.has(sessionID)) return { running: null, rerun: false, forceOnNextIdle: false }
+    const runtime: SessionRuntime = { running: null, rerun: false, forceOnNextIdle: false }
+    this.runtimeBySession.set(sessionID, runtime)
     return runtime
+  }
+
+  private isInactive(sessionID: string): boolean {
+    return this.stopped || this.deletedSessions.has(sessionID)
+  }
+
+  private sessionNotFound(sessionID: string): TimelineFailure {
+    return new TimelineFailure("session_not_found", `Session not found: ${sessionID}`, { sessionID })
+  }
+
+  private assertNotDeleted(sessionID: string): void {
+    if (this.deletedSessions.has(sessionID)) throw this.sessionNotFound(sessionID)
   }
 
   private now(): number {
@@ -138,6 +160,13 @@ export class TimelineEngine {
     if (event.type === "session.deleted") {
       const sessionID = sessionIDOf(event)
       if (!sessionID) return
+      this.deletedSessions.add(sessionID)
+      const runtime = this.runtimeBySession.get(sessionID)
+      if (runtime) {
+        if (runtime.backfill) runtime.backfill.cancelled = true
+        runtime.rerun = false
+        runtime.followUp = undefined
+      }
       this.clearTimers(sessionID)
       this.runtimeBySession.delete(sessionID)
       await this.deps.store.remove(sessionID).catch(() => undefined)
@@ -157,7 +186,11 @@ export class TimelineEngine {
     this.stopped = true
     this.controller?.abort()
     this.controller = undefined
-    for (const sessionID of this.runtimeBySession.keys()) this.clearTimers(sessionID)
+    for (const [sessionID, runtime] of this.runtimeBySession) {
+      runtime.rerun = false
+      runtime.followUp = undefined
+      this.clearTimers(sessionID)
+    }
     for (const waiter of this.waiters.splice(0)) waiter()
   }
 
@@ -171,7 +204,7 @@ export class TimelineEngine {
   }
 
   private scheduleDebounce(sessionID: string): void {
-    if (this.stopped) return
+    if (this.isInactive(sessionID)) return
     // A disabled engine (missing model, bad config) must not log an error on
     // every idle event.
     if (this.disabledReason) return
@@ -179,7 +212,7 @@ export class TimelineEngine {
     if (runtime.debounce !== undefined) this.clock.clearTimeout(runtime.debounce)
     runtime.debounce = this.clock.setTimeout(() => {
       runtime.debounce = undefined
-      if (this.stopped) return
+      if (this.isInactive(sessionID)) return
       if (runtime.forceOnNextIdle) {
         runtime.forceOnNextIdle = false
         void this.refreshWithOptions(sessionID, "force", true).catch((error) => {
@@ -194,13 +227,13 @@ export class TimelineEngine {
   }
 
   private scheduleForceTimer(sessionID: string, delayMs = this.deps.config.update.forceAfterMinutes * 60_000): void {
-    if (this.stopped) return
+    if (this.isInactive(sessionID)) return
     const runtime = this.runtime(sessionID)
     if (runtime.force !== undefined) this.clock.clearTimeout(runtime.force)
     runtime.force = this.clock.setTimeout(
       () => {
         runtime.force = undefined
-        if (this.stopped) return
+        if (this.isInactive(sessionID)) return
         void this.runForceTimer(sessionID).catch((error) => {
           this.log("force timer failed", { sessionID, error: sanitizeError(error) })
         })
@@ -210,9 +243,11 @@ export class TimelineEngine {
   }
 
   private async runForceTimer(sessionID: string): Promise<void> {
+    if (this.isInactive(sessionID)) return
     const document = await this.deps.store.load(sessionID)
-    if (!document?.watermark) return
+    if (this.isInactive(sessionID) || !document?.watermark) return
     const read = await readSessionMessages(this.deps.ctx, sessionID)
+    if (this.isInactive(sessionID)) return
     const slice = sliceAfterWatermark(read.messages, document.watermark)
     if (slice.kind !== "new") return
     if (await this.sessionBusy(sessionID, read.messages)) {
@@ -254,11 +289,27 @@ export class TimelineEngine {
     force: boolean,
   ): Promise<{ started: boolean; coalesced: boolean }> {
     const manual = reason === "manual"
+    if (this.stopped) {
+      if (manual) throw new TimelineFailure("internal", SHUTTING_DOWN_REASON)
+      return { started: false, coalesced: false }
+    }
+    if (this.deletedSessions.has(sessionID)) {
+      if (manual) throw this.sessionNotFound(sessionID)
+      return { started: false, coalesced: false }
+    }
     if (manual) this.assertEnabled()
     else if (this.disabledReason) return { started: false, coalesced: false }
 
     const info = await this.resolveSession(sessionID)
     const document = await this.deps.store.load(sessionID)
+    if (this.stopped) {
+      if (manual) throw new TimelineFailure("internal", SHUTTING_DOWN_REASON)
+      return { started: false, coalesced: false }
+    }
+    if (this.deletedSessions.has(sessionID)) {
+      if (manual) throw this.sessionNotFound(sessionID)
+      return { started: false, coalesced: false }
+    }
     if (!document?.watermark) {
       if (manual) throw new TimelineFailure("invalid_request", "Build the timeline first.")
       return { started: false, coalesced: false }
@@ -271,7 +322,8 @@ export class TimelineEngine {
       if (manual) throw new TimelineFailure("invalid_request", "The transcript changed; rebuild is required.")
       return { started: false, coalesced: false }
     }
-    return this.startTask(sessionID, () => this.refreshOnce(sessionID, info, reason, force))
+    const run = () => this.refreshOnce(sessionID, info, reason, force)
+    return this.startTask(sessionID, run, run)
   }
 
   private async refreshOnce(
@@ -280,13 +332,16 @@ export class TimelineEngine {
     reason: RefreshReason,
     force: boolean,
   ): Promise<void> {
+    if (this.isInactive(sessionID)) return
     const document = await this.deps.store.load(sessionID)
+    if (this.isInactive(sessionID)) return
     if (!document?.watermark) return
     if (document.backfill && document.backfill.completedAt === undefined) return
     if (document.meta.notice?.kind === "history-changed") return
     document.sessionTitle = info.title ?? document.sessionTitle
 
     const read = await readSessionMessages(this.deps.ctx, sessionID)
+    if (this.isInactive(sessionID)) return
     const slice = sliceAfterWatermark(read.messages, document.watermark)
     const now = this.nowIso()
 
@@ -299,6 +354,7 @@ export class TimelineEngine {
       if (read.partial) {
         document.meta.lastCheckedAt = now
         await this.persist(sessionID, document)
+        if (this.isInactive(sessionID)) return
         this.emitUpdated(document)
         return
       }
@@ -310,6 +366,7 @@ export class TimelineEngine {
         at: now,
       }
       await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
       this.emitUpdated(document)
       return
     }
@@ -320,6 +377,7 @@ export class TimelineEngine {
       delete document.meta.notice
       delete document.meta.lastError
       await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
       this.emitUpdated(document)
       return
     }
@@ -328,6 +386,7 @@ export class TimelineEngine {
       document.status = "stale"
       document.meta.lastCheckedAt = now
       await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
       this.emitUpdated(document)
       const oldest = slice.messages[0]
       const age = oldest ? this.now() - oldest.time.created : 0
@@ -346,6 +405,7 @@ export class TimelineEngine {
         at: now,
       }
       await this.persist(sessionID, document)
+      if (this.isInactive(sessionID)) return
       this.emitUpdated(document)
       return
     }
@@ -358,7 +418,7 @@ export class TimelineEngine {
     const chunks = chunkMessages(slice.messages, this.deps.config)
     let processed = 0
     for (const chunk of chunks) {
-      if (this.stopped) return
+      if (this.isInactive(sessionID)) return
       processed += chunk.length
       const digest = buildDigest(chunk, this.deps.config)
       const last = chunk[chunk.length - 1]
@@ -368,6 +428,9 @@ export class TimelineEngine {
         const previousWatermark = document.watermark
         this.advanceWatermark(document, last, read.messages.length)
         document.status = "ready"
+        document.meta.lastCheckedAt = this.nowIso()
+        delete document.meta.notice
+        delete document.meta.lastError
         try {
           await this.persist(sessionID, document)
         } catch (error) {
@@ -376,6 +439,7 @@ export class TimelineEngine {
           document.watermark = previousWatermark
           throw error
         }
+        if (this.isInactive(sessionID)) return
         this.emitProgress(sessionID, "update", processed, slice.messages.length, document.chapters.length)
         continue
       }
@@ -391,14 +455,14 @@ export class TimelineEngine {
       try {
         result = await this.callModel(prompt, digest.aliasMap)
       } catch (error) {
-        if (this.stopped) return
+        if (this.isInactive(sessionID)) return
         await this.handleModelFailure(sessionID, document, error, prompt.length, automatic, 1)
         return
       }
 
-      // A stop can land while the model call is in flight. Never apply a late
-      // result to the persisted document.
-      if (this.stopped) return
+      // A stop or session deletion can land while the model call is in flight.
+      // Never apply a late result to the persisted document.
+      if (this.isInactive(sessionID)) return
 
       applyOutput(document, {
         output: result.output,
@@ -421,9 +485,11 @@ export class TimelineEngine {
         document.watermark = previousWatermark
         throw error
       }
+      if (this.isInactive(sessionID)) return
       this.emitProgress(sessionID, "update", processed, slice.messages.length, document.chapters.length)
     }
 
+    if (this.isInactive(sessionID)) return
     this.emitUpdated(document)
   }
 
@@ -477,12 +543,13 @@ export class TimelineEngine {
     this.recordCalls(document, charCount, automatic, callCount)
     const cause = error instanceof ModelCallFailure ? error.cause : error
     if (cause instanceof ModelFailure && (cause.kind === "auth" || cause.kind === "config")) {
-      this.disabledReason = cause.message
+      this.disabledReason = sanitizeError(cause)
     }
     document.status = "error"
     document.meta.lastCheckedAt = now
     document.meta.lastError = failure
     await this.persist(sessionID, document)
+    if (this.isInactive(sessionID)) return
     this.emitUpdated(document)
     this.emitError(sessionID, failure)
   }
@@ -525,11 +592,19 @@ export class TimelineEngine {
   }
 
   private async persist(sessionID: string, document: TimelineDocument): Promise<void> {
+    if (this.isInactive(sessionID)) return
     try {
       await this.deps.store.save(document, this.nowIso())
+      if (this.deletedSessions.has(sessionID)) {
+        // The deletion may have raced the save. Never leave the document behind.
+        await this.deps.store.remove(sessionID).catch(() => undefined)
+        return
+      }
+      if (this.stopped) return
       const runtime = this.runtime(sessionID)
       delete runtime.error
     } catch (error) {
+      if (this.isInactive(sessionID)) return
       const failure: TimelineError = {
         message: sanitizeError(error),
         at: this.nowIso(),
@@ -574,22 +649,22 @@ export class TimelineEngine {
   }
 
   private async resolveSession(sessionID: string): Promise<SessionInfo> {
+    this.assertNotDeleted(sessionID)
     let info: SessionInfo
     try {
       info = await this.deps.ctx.session.get({ sessionID })
     } catch (error) {
       if (isNotFound(error)) {
         await this.deps.store.remove(sessionID).catch(() => undefined)
-        throw new TimelineFailure("session_not_found", `Session not found: ${sessionID}`, {
-          sessionID,
-        })
+        throw this.sessionNotFound(sessionID)
       }
       // A transport or host failure is not a missing session; keep the
       // distinction so the panel can offer a retry instead of a dead end.
       throw new TimelineFailure("internal", sanitizeError(error))
     }
+    this.assertNotDeleted(sessionID)
     if (info.projectID !== this.deps.ctx.location.project.id) {
-      throw new TimelineFailure("session_not_found", `Session not found: ${sessionID}`, { sessionID })
+      throw this.sessionNotFound(sessionID)
     }
     if (info.parentID) {
       throw new TimelineFailure("invalid_request", "Recap is available for root sessions only.", {
@@ -611,12 +686,12 @@ export class TimelineEngine {
   private async validateModel(): Promise<void> {
     if (this.disabledReason) return
     if (!this.deps.config.enabled) {
-      this.disabledReason = "Recap is disabled."
+      this.disabledReason = DISABLED_REASON
       return
     }
     const model = this.deps.config.model
     if (!model) {
-      this.disabledReason = "Recap requires an explicit `model`."
+      this.disabledReason = MISSING_MODEL_REASON
       return
     }
     try {
@@ -661,6 +736,7 @@ export class TimelineEngine {
   ): { started: boolean; coalesced: boolean } {
     const runtime = this.runtime(sessionID)
     if (runtime.running) {
+      runtime.followUp = followUp ?? task
       runtime.rerun = true
       return { started: false, coalesced: true }
     }
@@ -670,14 +746,18 @@ export class TimelineEngine {
         for (;;) {
           runtime.rerun = false
           await current()
-          if (!runtime.rerun || this.stopped) break
-          current = followUp ?? task
+          if (!runtime.rerun || this.isInactive(sessionID)) break
+          const pending = runtime.followUp
+          runtime.followUp = undefined
+          current = pending ?? followUp ?? task
         }
       } catch (error) {
         const failure = toTimelineError(error, this.nowIso())
         runtime.error = failure
         this.emitError(sessionID, failure)
       } finally {
+        runtime.followUp = undefined
+        runtime.rerun = false
         runtime.running = null
         runtime.progress = undefined
       }
@@ -694,6 +774,7 @@ export class TimelineEngine {
   }
 
   async get(sessionID: string): Promise<GetResult> {
+    this.assertNotDeleted(sessionID)
     await this.resolveSession(sessionID)
     const document = await this.recoverInterrupted(sessionID)
     const runtime = this.runtime(sessionID)
@@ -706,6 +787,7 @@ export class TimelineEngine {
   }
 
   async ensure(sessionID: string): Promise<EnsureResult> {
+    this.assertNotDeleted(sessionID)
     await this.resolveSession(sessionID)
     const document = await this.recoverInterrupted(sessionID)
     const runtime = this.runtime(sessionID)
@@ -770,7 +852,11 @@ export class TimelineEngine {
 
   private async recoverInterrupted(sessionID: string): Promise<TimelineDocument | null> {
     const document = await this.deps.store.load(sessionID)
+    this.assertNotDeleted(sessionID)
     if (!document) return null
+    // A disabled or stopped engine must not rewrite a document just to report
+    // an interrupted backfill; the caller only needs the stored state.
+    if (this.disabledReason || this.stopped) return document
     const runtime = this.runtime(sessionID)
     if (document.status === "backfilling" && runtime.running === null) {
       document.status = document.backfill?.error ? "error" : "paused"

@@ -69,6 +69,7 @@ export class FakeClock implements Clock {
 
 export class FakeStorage {
   readonly values = new Map<string, unknown>()
+  writes = 0
   failNextSet = false
   failSet = false
 
@@ -78,6 +79,7 @@ export class FakeStorage {
   }
 
   async set(key: string, value: unknown): Promise<void> {
+    this.writes += 1
     if (this.failNextSet) {
       this.failNextSet = false
       throw new Error("disk full")
