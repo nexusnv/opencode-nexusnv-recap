@@ -103,8 +103,26 @@ describe("parseModelOutput top-level validation", () => {
     expect(output.chapters[0]?.title).toBe("Extended")
   })
 
+  test("omits a null chapter ID", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [chapter({ mode: "extend", chapterID: null })],
+      }),
+    )
+
+    expect(output.chapters[0]?.mode).toBe("extend")
+    expect(output.chapters[0]).not.toHaveProperty("chapterID")
+  })
+
   test("unwraps JSON inside a code fence", () => {
     const raw = `\`\`\`json\n${JSON.stringify(noOp())}\n\`\`\``
+    expect(expectOutput(parseModelOutput(raw, ALIASES))).toStrictEqual({ goal: null, tasks: null, chapters: [] })
+  })
+
+  test("unwraps a fenced JSON block embedded in prose", () => {
+    const raw = `Here is the JSON:\n\`\`\`json\n${JSON.stringify(noOp())}\n\`\`\`\nDone.`
     expect(expectOutput(parseModelOutput(raw, ALIASES))).toStrictEqual({ goal: null, tasks: null, chapters: [] })
   })
 
@@ -134,6 +152,15 @@ describe("parseModelOutput top-level validation", () => {
       const partial = Object.fromEntries(Object.entries(full).filter(([key]) => key !== field))
       expect(expectError(parse(partial))).toContain(field)
     }
+  })
+
+  test("reports multiple top-level validation issues", () => {
+    const error = expectError(parse({}))
+
+    expect(error).toContain("goal")
+    expect(error).toContain("tasks")
+    expect(error).toContain("chapters")
+    expect(error.split("; ").length).toBeGreaterThanOrEqual(3)
   })
 })
 
@@ -203,6 +230,39 @@ describe("parseModelOutput limits", () => {
 
     expect(output.tasks?.[0]?.title).toHaveLength(60)
   })
+
+  test("truncates at code point boundaries without splitting surrogate pairs", () => {
+    const emoji = "😀"
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: [{ key: "emoji", title: `${"a".repeat(59)}${emoji}`, status: "open" }],
+        chapters: [
+          chapter({
+            title: `${"t".repeat(59)}${emoji}`,
+            summary: `${"s".repeat(179)}${emoji}`,
+            highlights: [highlight({ text: `${"h".repeat(159)}${emoji}` })],
+          }),
+        ],
+      }),
+    )
+
+    const taskTitle = output.tasks?.[0]?.title ?? ""
+    const chapterTitle = output.chapters[0]?.title ?? ""
+    const summary = output.chapters[0]?.summary ?? ""
+    const text = output.chapters[0]?.highlights[0]?.text ?? ""
+
+    for (const [value, length] of [
+      [taskTitle, 60],
+      [chapterTitle, 60],
+      [summary, 180],
+      [text, 160],
+    ] as const) {
+      expect(Array.from(value)).toHaveLength(length)
+      expect(value.endsWith(emoji)).toBe(true)
+      expect(value.isWellFormed()).toBe(true)
+    }
+  })
 })
 
 describe("parseModelOutput per-item leniency", () => {
@@ -220,6 +280,34 @@ describe("parseModelOutput per-item leniency", () => {
     )
 
     expect(output.tasks?.map((task) => task.key)).toEqual(["valid", "blocked"])
+  })
+
+  test("returns null instead of clearing the ledger when every task is invalid", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: [{ key: "a", title: "A", status: "doing", anchor: null }],
+        chapters: [],
+      }),
+    )
+
+    expect(output.tasks).toBeNull()
+  })
+
+  test("drops tasks with whitespace-only keys or titles", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: [
+          { key: "   ", title: "Blank key", status: "open" },
+          { key: "blank-title", title: " \t ", status: "open" },
+          { key: "kept", title: "  Keep me  ", status: "open" },
+        ],
+        chapters: [],
+      }),
+    )
+
+    expect(output.tasks).toStrictEqual([{ key: "kept", title: "Keep me", status: "open" }])
   })
 
   test("drops highlights with an invalid kind or a missing anchor but keeps valid ones", () => {
@@ -298,6 +386,19 @@ describe("parseModelOutput per-item leniency", () => {
     expect(output.tasks?.[1]).not.toHaveProperty("anchorMessageID")
   })
 
+  test("treats a null task anchor as omitted", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: [{ key: "null-anchor", title: "Null anchor", status: "open", anchor: null }],
+        chapters: [],
+      }),
+    )
+
+    expect(output.tasks?.[0]).toStrictEqual({ key: "null-anchor", title: "Null anchor", status: "open" })
+    expect(output.tasks?.[0]).not.toHaveProperty("anchorMessageID")
+  })
+
   test("drops an artifact URL that is not http(s) but keeps the highlight", () => {
     const output = expectOutput(
       parse({
@@ -318,6 +419,129 @@ describe("parseModelOutput per-item leniency", () => {
 
     expect(output.chapters[0]?.highlights[0]?.text).toBe("unsafe artifact")
     expect(output.chapters[0]?.highlights[0]?.artifact).toBeUndefined()
+  })
+
+  test("treats a null artifact as omitted", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [chapter({ highlights: [highlight({ text: "no artifact", artifact: null })] })],
+      }),
+    )
+
+    expect(output.chapters[0]?.highlights[0]?.text).toBe("no artifact")
+    expect(output.chapters[0]?.highlights[0]?.artifact).toBeUndefined()
+  })
+
+  test("strips unknown artifact fields and keeps a valid URL", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          chapter({
+            highlights: [
+              highlight({
+                text: "PR with extras",
+                artifact: { type: "pr", url: "https://github.com/acme/repo/pull/7", number: 7 },
+              }),
+            ],
+          }),
+        ],
+      }),
+    )
+
+    expect(output.chapters[0]?.highlights[0]?.artifact).toStrictEqual({
+      type: "pr",
+      url: "https://github.com/acme/repo/pull/7",
+    })
+  })
+
+  test("omits an invalid PR state but keeps the artifact", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          chapter({
+            highlights: [
+              highlight({
+                text: "PR bad state",
+                artifact: { type: "pr", url: "https://github.com/acme/repo/pull/8", state: "draft" },
+              }),
+            ],
+          }),
+        ],
+      }),
+    )
+
+    expect(output.chapters[0]?.highlights[0]?.artifact).toStrictEqual({
+      type: "pr",
+      url: "https://github.com/acme/repo/pull/8",
+    })
+    expect(output.chapters[0]?.highlights[0]?.artifact).not.toHaveProperty("state")
+  })
+
+  test("omits state from a commit artifact even when it is invalid", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          chapter({
+            highlights: [
+              highlight({
+                kind: "commit",
+                text: "Commit bad state",
+                artifact: { type: "commit", url: "https://github.com/acme/repo/commit/def456", state: "pushed" },
+              }),
+            ],
+          }),
+        ],
+      }),
+    )
+
+    expect(output.chapters[0]?.highlights[0]?.artifact).toStrictEqual({
+      type: "commit",
+      url: "https://github.com/acme/repo/commit/def456",
+    })
+  })
+
+  test("treats a whitespace artifact URL as absent", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          chapter({
+            highlights: [highlight({ text: "Whitespace URL", artifact: { type: "pr", url: "   " } })],
+          }),
+        ],
+      }),
+    )
+
+    expect(output.chapters[0]?.highlights[0]?.artifact).toStrictEqual({ type: "pr" })
+    expect(output.chapters[0]?.highlights[0]?.artifact).not.toHaveProperty("url")
+  })
+
+  test("does not let an extra id field stand in for a missing chapter field", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          {
+            mode: "extend",
+            id: "ch_existing",
+            summary: "Missing title",
+            highlights: [highlight()],
+          },
+        ],
+      }),
+    )
+
+    expect(output.chapters).toStrictEqual([])
   })
 
   test("removes state from a commit artifact", () => {

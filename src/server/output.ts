@@ -46,29 +46,29 @@ const topSchema = z.strictObject({
   chapters: z.array(z.unknown()),
 })
 
-const taskSchema = z.strictObject({
-  key: z.string().min(1),
-  title: z.string().min(1),
+const taskSchema = z.object({
+  key: z.string().trim().min(1),
+  title: z.string().trim().min(1),
   status: z.enum(["open", "done", "blocked"]),
-  anchor: z.string().min(1).optional(),
+  anchor: z.string().min(1).nullish(),
 })
 
-const artifactSchema = z.strictObject({
+const artifactSchema = z.object({
   type: z.enum(["pr", "commit"]),
-  url: z.string().optional(),
-  state: z.enum(["opened", "merged", "closed"]).optional(),
+  url: z.string().trim().nullish(),
+  state: z.string().trim().nullish(),
 })
 
-const highlightSchema = z.strictObject({
+const highlightSchema = z.object({
   kind: z.enum(["decision", "implementation", "task", "pr", "commit", "issue", "note"]),
   text: z.string().min(1),
   anchor: z.string().min(1),
-  artifact: artifactSchema.optional(),
+  artifact: artifactSchema.nullish(),
 })
 
-const chapterSchema = z.strictObject({
+const chapterSchema = z.object({
   mode: z.enum(["extend", "new"]),
-  chapterID: z.string().min(1).optional(),
+  chapterID: z.string().min(1).nullish(),
   title: z.string(),
   summary: z.string(),
   highlights: z.array(z.unknown()),
@@ -93,7 +93,7 @@ export function parseModelOutput(raw: string, aliases: ReadonlyMap<string, Diges
   return { ok: true, output: { goal, tasks, chapters } }
 }
 
-function parseTasks(values: readonly unknown[], aliases: ReadonlyMap<string, DigestAlias>): ValidatedTask[] {
+function parseTasks(values: readonly unknown[], aliases: ReadonlyMap<string, DigestAlias>): ValidatedTask[] | null {
   const byKey = new Map<string, ValidatedTask>()
   for (const value of values.slice(0, 100)) {
     const parsed = taskSchema.safeParse(value)
@@ -102,11 +102,12 @@ function parseTasks(values: readonly unknown[], aliases: ReadonlyMap<string, Dig
     const anchor = parsed.data.anchor ? aliases.get(parsed.data.anchor) : undefined
     byKey.set(key, {
       key,
-      title: parsed.data.title.trim().slice(0, 60),
+      title: truncate(parsed.data.title, 60),
       status: parsed.data.status,
       ...(parsed.data.anchor ? { anchorMessageID: anchor?.messageID ?? null } : {}),
     })
   }
+  if (values.length > 0 && byKey.size === 0) return null
   return [...byKey.values()]
 }
 
@@ -120,8 +121,8 @@ function parseChapters(values: readonly unknown[], aliases: ReadonlyMap<string, 
     chapters.push({
       mode: parsed.data.mode,
       ...(parsed.data.chapterID ? { chapterID: parsed.data.chapterID } : {}),
-      title: parsed.data.title.trim().slice(0, 60),
-      summary: parsed.data.summary.trim().slice(0, 180),
+      title: truncate(parsed.data.title.trim(), 60),
+      summary: truncate(parsed.data.summary.trim(), 180),
       highlights,
     })
   }
@@ -136,7 +137,7 @@ function parseHighlights(values: readonly unknown[], aliases: ReadonlyMap<string
     if (!parsed.success) continue
     const alias = aliases.get(parsed.data.anchor)
     if (!alias) continue
-    const text = parsed.data.text.trim().slice(0, 160)
+    const text = truncate(parsed.data.text.trim(), 160)
     if (!text) continue
     const key = normalizeText(text)
     if (seen.has(key)) continue
@@ -155,19 +156,24 @@ function parseHighlights(values: readonly unknown[], aliases: ReadonlyMap<string
 
 function sanitizeArtifact(artifact: {
   type: "pr" | "commit"
-  url?: string | undefined
-  state?: "opened" | "merged" | "closed" | undefined
+  url?: string | null | undefined
+  state?: string | null | undefined
 }): ValidatedHighlight["artifact"] {
   // Spec §7.4: a URL that is not http(s) is dropped together with the artifact;
   // the highlight itself is still kept.
-  if (artifact.url !== undefined && !isHttpUrl(artifact.url)) return undefined
-  const url = artifact.url
+  const url = artifact.url?.trim() || undefined
+  if (url !== undefined && !isHttpUrl(url)) return undefined
   if (artifact.type === "commit") return { type: "commit", ...(url ? { url } : {}) }
+  const state = validArtifactState(artifact.state)
   return {
     type: "pr",
     ...(url ? { url } : {}),
-    ...(artifact.state ? { state: artifact.state } : {}),
+    ...(state ? { state } : {}),
   }
+}
+
+function validArtifactState(state: string | null | undefined): "opened" | "merged" | "closed" | undefined {
+  return state === "opened" || state === "merged" || state === "closed" ? state : undefined
 }
 
 function isHttpUrl(value: string): boolean {
@@ -181,13 +187,17 @@ function isHttpUrl(value: string): boolean {
 
 function unwrapFence(raw: string): string {
   const trimmed = raw.trim()
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed)
+  const fenced = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(trimmed)
   return fenced?.[1]?.trim() ?? trimmed
 }
 
 function formatZod(error: z.ZodError): string {
-  const first = error.issues[0]
-  return first ? `${first.path.join(".") || "output"}: ${first.message}` : "invalid output"
+  const issues = error.issues.slice(0, 8).map((issue) => `${issue.path.join(".") || "output"}: ${issue.message}`)
+  return issues.length > 0 ? issues.join("; ") : "invalid output"
+}
+
+function truncate(text: string, max: number): string {
+  return [...text].slice(0, max).join("")
 }
 
 function messageOf(error: unknown): string {
