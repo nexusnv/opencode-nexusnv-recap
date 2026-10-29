@@ -46,11 +46,16 @@ const topSchema = z.strictObject({
   chapters: z.array(z.unknown()),
 })
 
+const optionalTrimmedString = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().trim().min(1).nullish(),
+)
+
 const taskSchema = z.object({
   key: z.string().trim().min(1),
   title: z.string().trim().min(1),
   status: z.enum(["open", "done", "blocked"]),
-  anchor: z.string().min(1).nullish(),
+  anchor: optionalTrimmedString,
 })
 
 const artifactSchema = z.object({
@@ -68,22 +73,19 @@ const highlightSchema = z.object({
 
 const chapterSchema = z.object({
   mode: z.enum(["extend", "new"]),
-  chapterID: z.string().min(1).nullish(),
+  chapterID: optionalTrimmedString,
   title: z.string(),
   summary: z.string(),
   highlights: z.array(z.unknown()),
 })
 
-export function parseModelOutput(raw: string, aliases: ReadonlyMap<string, DigestAlias>): ParseResult {
-  const json = unwrapFence(raw)
-  let decoded: unknown
-  try {
-    decoded = JSON.parse(json)
-  } catch (error) {
-    return { ok: false, error: `Invalid JSON: ${messageOf(error)}` }
-  }
+type DecodeResult = { ok: true; value: unknown } | { ok: false; error: string }
 
-  const top = topSchema.safeParse(decoded)
+export function parseModelOutput(raw: string, aliases: ReadonlyMap<string, DigestAlias>): ParseResult {
+  const decoded = decodeJson(raw)
+  if (!decoded.ok) return decoded
+
+  const top = topSchema.safeParse(decoded.value)
   if (!top.success) return { ok: false, error: formatZod(top.error) }
 
   const goal = top.data.goal.trim() || null
@@ -185,10 +187,46 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
-function unwrapFence(raw: string): string {
+function decodeJson(raw: string): DecodeResult {
   const trimmed = raw.trim()
-  const fenced = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(trimmed)
-  return fenced?.[1]?.trim() ?? trimmed
+  let directError: unknown
+  try {
+    return { ok: true, value: JSON.parse(trimmed) }
+  } catch (error) {
+    directError = error
+  }
+
+  // A whole-response fence must capture greedily so fence pairs inside JSON
+  // strings do not terminate the body early.
+  const wholeFence = /^```[^\n]*\r?\n([\s\S]*)\r?\n?```$/i.exec(trimmed)
+  if (wholeFence) {
+    try {
+      return { ok: true, value: JSON.parse(wholeFence[1]?.trim() ?? "") }
+    } catch {
+      // Fall through to scanning individual fenced blocks.
+    }
+  }
+
+  const blocks = /```[a-zA-Z0-9_-]*[ \t]*(?:\r?\n)?([\s\S]*?)```/g
+  let fallback: { value: unknown } | undefined
+  for (const match of trimmed.matchAll(blocks)) {
+    const body = match[1]?.trim()
+    if (!body) continue
+    let value: unknown
+    try {
+      value = JSON.parse(body)
+    } catch {
+      continue
+    }
+    if (isJsonObject(value)) return { ok: true, value }
+    fallback ??= { value }
+  }
+  if (fallback) return { ok: true, ...fallback }
+  return { ok: false, error: `Invalid JSON: ${messageOf(directError)}` }
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function formatZod(error: z.ZodError): string {

@@ -116,6 +116,37 @@ describe("parseModelOutput top-level validation", () => {
     expect(output.chapters[0]).not.toHaveProperty("chapterID")
   })
 
+  test("treats blank and whitespace chapter IDs as omitted", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          chapter({ mode: "extend", chapterID: "", title: "Empty ID" }),
+          chapter({ mode: "extend", chapterID: "   ", title: "Whitespace ID" }),
+        ],
+      }),
+    )
+
+    expect(output.chapters.map((entry) => entry.title)).toEqual(["Empty ID", "Whitespace ID"])
+    for (const entry of output.chapters) {
+      expect(entry.mode).toBe("extend")
+      expect(entry).not.toHaveProperty("chapterID")
+    }
+  })
+
+  test("trims a non-empty chapter ID before storing it", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [chapter({ mode: "extend", chapterID: "  ch_existing  " })],
+      }),
+    )
+
+    expect(output.chapters[0]?.chapterID).toBe("ch_existing")
+  })
+
   test("unwraps JSON inside a code fence", () => {
     const raw = `\`\`\`json\n${JSON.stringify(noOp())}\n\`\`\``
     expect(expectOutput(parseModelOutput(raw, ALIASES))).toStrictEqual({ goal: null, tasks: null, chapters: [] })
@@ -123,6 +154,31 @@ describe("parseModelOutput top-level validation", () => {
 
   test("unwraps a fenced JSON block embedded in prose", () => {
     const raw = `Here is the JSON:\n\`\`\`json\n${JSON.stringify(noOp())}\n\`\`\`\nDone.`
+    expect(expectOutput(parseModelOutput(raw, ALIASES))).toStrictEqual({ goal: null, tasks: null, chapters: [] })
+  })
+
+  test("parses raw JSON containing a fence pair inside a string", () => {
+    const raw = '{"goal":"Use ```bash``` for the demo","tasks":null,"chapters":[]}'
+    const output = expectOutput(parseModelOutput(raw, ALIASES))
+
+    expect(output.goal).toBe("Use ```bash``` for the demo")
+  })
+
+  test("parses a whole fenced response whose string contains a fence pair", () => {
+    const payload = { goal: "Use ```bash``` for the demo", tasks: null, chapters: [] }
+    const raw = `\`\`\`json\n${JSON.stringify(payload)}\n\`\`\``
+    const output = expectOutput(parseModelOutput(raw, ALIASES))
+
+    expect(output.goal).toBe("Use ```bash``` for the demo")
+  })
+
+  test("selects a later json fence after an earlier unrelated fenced block", () => {
+    const raw = `Here is an example:\n\`\`\`bash\necho "hello"\n\`\`\`\nAnd the JSON:\n\`\`\`json\n${JSON.stringify(noOp())}\n\`\`\`\nDone.`
+    expect(expectOutput(parseModelOutput(raw, ALIASES))).toStrictEqual({ goal: null, tasks: null, chapters: [] })
+  })
+
+  test("prefers a fenced JSON object over an earlier fenced non-object value", () => {
+    const raw = `A note:\n\`\`\`text\n"just a note"\n\`\`\`\nThe JSON:\n\`\`\`json\n${JSON.stringify(noOp())}\n\`\`\``
     expect(expectOutput(parseModelOutput(raw, ALIASES))).toStrictEqual({ goal: null, tasks: null, chapters: [] })
   })
 
@@ -399,6 +455,39 @@ describe("parseModelOutput per-item leniency", () => {
     expect(output.tasks?.[0]).not.toHaveProperty("anchorMessageID")
   })
 
+  test("treats blank and whitespace task anchors as omitted", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: [
+          { key: "empty-anchor", title: "Empty anchor", status: "open", anchor: "" },
+          { key: "spaces-anchor", title: "Whitespace anchor", status: "open", anchor: "   " },
+        ],
+        chapters: [],
+      }),
+    )
+
+    expect(output.tasks).toStrictEqual([
+      { key: "empty-anchor", title: "Empty anchor", status: "open" },
+      { key: "spaces-anchor", title: "Whitespace anchor", status: "open" },
+    ])
+    for (const task of output.tasks ?? []) expect(task).not.toHaveProperty("anchorMessageID")
+  })
+
+  test("trims a non-empty task anchor before resolving it", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: [{ key: "padded-anchor", title: "Padded anchor", status: "open", anchor: "  m1  " }],
+        chapters: [],
+      }),
+    )
+
+    expect(output.tasks).toStrictEqual([
+      { key: "padded-anchor", title: "Padded anchor", status: "open", anchorMessageID: "msg_1" },
+    ])
+  })
+
   test("drops an artifact URL that is not http(s) but keeps the highlight", () => {
     const output = expectOutput(
       parse({
@@ -455,6 +544,65 @@ describe("parseModelOutput per-item leniency", () => {
     expect(output.chapters[0]?.highlights[0]?.artifact).toStrictEqual({
       type: "pr",
       url: "https://github.com/acme/repo/pull/7",
+    })
+  })
+
+  test("strips unknown keys from a task, chapter, and highlight while keeping them", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: [{ key: "task", title: "Task", status: "open", extra: "ignored" }],
+        chapters: [
+          {
+            mode: "new",
+            title: "Chapter",
+            summary: "Summary",
+            extra: "ignored",
+            highlights: [highlight({ extra: "ignored" })],
+          },
+        ],
+      }),
+    )
+
+    expect(output.tasks).toStrictEqual([{ key: "task", title: "Task", status: "open" }])
+    expect(output.chapters).toStrictEqual([
+      {
+        mode: "new",
+        title: "Chapter",
+        summary: "Summary",
+        highlights: [
+          {
+            kind: "implementation",
+            text: "Implemented the change",
+            at: "2026-10-29T10:00:00.000Z",
+            anchorMessageID: "msg_1",
+          },
+        ],
+      },
+    ])
+  })
+
+  test("trims whitespace around an artifact URL before storing it", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          chapter({
+            highlights: [
+              highlight({
+                text: "Padded URL",
+                artifact: { type: "pr", url: "  https://github.com/acme/repo/pull/9  " },
+              }),
+            ],
+          }),
+        ],
+      }),
+    )
+
+    expect(output.chapters[0]?.highlights[0]?.artifact).toStrictEqual({
+      type: "pr",
+      url: "https://github.com/acme/repo/pull/9",
     })
   })
 
