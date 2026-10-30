@@ -46,8 +46,15 @@ export class ModelCallFailure extends Error {
 }
 
 export function sanitizeError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error)
+  const message = errorMessage(error)
   return redactSecrets(message).replace(/\s+/g, " ").trim().slice(0, 500) || "Unknown error"
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message || error.name
+  if (isRecord(error) && typeof error.message === "string" && error.message.length > 0) return error.message
+  if (error === undefined || error === null) return ""
+  return String(error)
 }
 
 export function isNotFound(error: unknown): boolean {
@@ -62,8 +69,17 @@ export function isNotFound(error: unknown): boolean {
       }
     }
   }
-  const message = error instanceof Error ? error.message.toLowerCase() : ""
-  return message.includes("not found") || message.includes("404")
+  // The host wraps some failures in an Error whose `message` is empty and whose
+  // classification lives in `name` / `_tag` (for example `Session.NotFoundError`).
+  const text = [
+    error instanceof Error ? error.message : "",
+    error instanceof Error ? error.name : "",
+    isRecord(error) && typeof error.name === "string" ? error.name : "",
+    isRecord(error) && typeof error["_tag"] === "string" ? error["_tag"] : "",
+  ]
+    .join(" ")
+    .toLowerCase()
+  return text.includes("not found") || text.includes("notfound") || text.includes("404")
 }
 
 export function sessionIDOf(event: unknown): string | undefined {
