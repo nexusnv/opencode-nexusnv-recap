@@ -21,6 +21,7 @@ export interface FakeUiCalls {
   readonly toasts: unknown[]
   readonly confirms: unknown[]
   readonly dialogs: number
+  readonly dialogSet: unknown[]
 }
 
 export interface FakeTuiOptions {
@@ -37,7 +38,8 @@ export function fakeTui(overrides: Partial<FakeRpc> = {}, options: FakeTuiOption
     toasts: unknown[]
     confirms: unknown[]
     dialogs: number
-  } = { panelOpen: [], panelClose: 0, toasts: [], confirms: [], dialogs: 0 }
+    dialogSet: unknown[]
+  } = { panelOpen: [], panelClose: 0, toasts: [], confirms: [], dialogs: 0, dialogSet: [] }
   const handlers = new Map<string, Array<(event: { data: Record<string, unknown> }) => void>>()
   const layers: Array<() => KeymapLayer> = []
   const record =
@@ -128,7 +130,9 @@ export function fakeTui(overrides: Partial<FakeRpc> = {}, options: FakeTuiOption
         show: () => {
           uiCalls.dialogs += 1
         },
-        set: () => undefined,
+        set: (value: unknown) => {
+          uiCalls.dialogSet.push(value)
+        },
         clear: () => undefined,
         alert: async () => undefined,
         prompt: async () => undefined,
