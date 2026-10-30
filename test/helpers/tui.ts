@@ -157,7 +157,7 @@ export function fakeTui(overrides: Partial<FakeRpc> = {}, options: FakeTuiOption
 }
 
 function fakeTheme(): Context["theme"] {
-  const color = { r: 255, g: 255, b: 255, a: 1 } as never
+  const color = "#aabbcc"
   return {
     text: {
       base: color,
