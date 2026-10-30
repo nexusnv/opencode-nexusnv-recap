@@ -70,11 +70,17 @@ export class FakeClock implements Clock {
 export class FakeStorage {
   readonly values = new Map<string, unknown>()
   writes = 0
+  removes = 0
   failNextSet = false
   failSet = false
+  beforeGet?: ((key: string) => Promise<void> | void) | undefined
+  beforeSet?: ((key: string, value: unknown) => Promise<void> | void) | undefined
+  beforeRemove?: ((key: string) => Promise<void> | void) | undefined
 
   async get(key: string): Promise<unknown> {
+    // Capture the value before the hook so a test can hold a stale snapshot.
     const value = this.values.get(key)
+    await this.beforeGet?.(key)
     return value === undefined ? undefined : structuredClone(value)
   }
 
@@ -85,10 +91,13 @@ export class FakeStorage {
       throw new Error("disk full")
     }
     if (this.failSet) throw new Error("disk full")
+    await this.beforeSet?.(key, value)
     this.values.set(key, structuredClone(value))
   }
 
   async remove(key: string): Promise<void> {
+    this.removes += 1
+    await this.beforeRemove?.(key)
     this.values.delete(key)
   }
 
@@ -200,6 +209,7 @@ export interface TestEngineOptions {
   modelList?: unknown
   disabledReason?: string
   storage?: FakeStorage
+  beforeContext?: ((sessionID: string) => Promise<void> | void) | undefined
 }
 
 export type RecordedEngineEvent =
@@ -288,6 +298,7 @@ export function createTestEngine(options: TestEngineOptions = {}): TestEngineHar
         return session
       },
       async context() {
+        await options.beforeContext?.(sessionID)
         return messages
       },
     },
