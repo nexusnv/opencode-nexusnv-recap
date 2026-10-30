@@ -8,17 +8,18 @@ import { artifactSummary, relativeTime, statusColor, statusLabel, taskSummary } 
 export function TimelineHeader(props: {
   readonly context: Context
   readonly document: TimelineDocument
-  readonly busy: boolean
   readonly disabled: boolean
 }) {
   const header = () => deriveHeader(props.document)
-  const status = () => statusLabel(props.document.status, props.disabled, props.busy)
+  // The persisted status already distinguishes a backfill (`backfilling`) from
+  // an incremental update, so a generic busy flag must not override it.
+  const status = () => statusLabel(props.document.status, props.disabled, false)
 
   return (
     <box flexDirection="column" flexShrink={0} paddingBottom={1}>
       <box flexDirection="row" justifyContent="space-between">
         <text fg={props.context.theme.text.base}>Recap</text>
-        <text fg={statusColor(props.context, props.document.status, props.disabled, props.busy)}>
+        <text fg={statusColor(props.context, props.document.status, props.disabled, false)}>
           {status()} · {relativeTime(props.document.meta.updatedAt)} · {props.document.meta.model.modelID}
         </text>
       </box>
@@ -43,11 +44,6 @@ export function TimelineHeader(props: {
       </Show>
       <Show when={props.document.coverage.partial}>
         <text fg={props.context.theme.text.feedback.warning.base}>Partial: earlier history was compacted.</text>
-      </Show>
-      <Show when={props.document.meta.notice}>
-        <text fg={props.context.theme.text.feedback.warning.base} wrapMode="word">
-          {props.document.meta.notice?.message}
-        </text>
       </Show>
     </box>
   )

@@ -12,6 +12,9 @@ export function TimelineCommands(props: { readonly context: Context }) {
         description: "Show the highlight recap for the current session",
         group: "Recap",
         palette: true,
+        // The panel needs a selected session; keep the command out of discovery
+        // and slash completion elsewhere.
+        enabled: () => props.context.ui.router.current().type === "session",
         // `/timeline` is a host command; use a distinct slash name.
         slash: { name: "recap" },
         run() {

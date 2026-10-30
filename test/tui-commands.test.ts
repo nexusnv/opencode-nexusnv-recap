@@ -25,6 +25,16 @@ describe("TimelineCommands", () => {
     expect(command.bind).toBeUndefined()
   })
 
+  test("is enabled only on a session route", () => {
+    const { command } = commandFor()
+    const enabled = typeof command.enabled === "function" ? command.enabled() : command.enabled
+    expect(enabled).toBe(true)
+
+    const { command: home } = commandFor({ route: { type: "home" } })
+    const homeEnabled = typeof home.enabled === "function" ? home.enabled() : home.enabled
+    expect(homeEnabled).toBe(false)
+  })
+
   test("opens the panel on a session route", () => {
     const { fake, command } = commandFor()
     command.run()

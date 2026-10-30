@@ -50,6 +50,9 @@ export function createTimelineState(context: Context, sessionID: string): Timeli
   const [loading, setLoading] = createSignal(true)
   const [requestError, setRequestError] = createSignal<string>()
   const [progress, setProgress] = createSignal<TimelineProgress>()
+  // Seed from the loaded document so the first progress event can detect a
+  // chapter-count change instead of being treated as the baseline.
+  let lastProgressChapters: number | undefined
 
   function applyEnvelope(value: unknown): void {
     if (!isRecord(value)) throw new TypeError("Recap returned an invalid response")
@@ -68,6 +71,7 @@ export function createTimelineState(context: Context, sessionID: string): Timeli
     setEstimate(isEstimate(value.estimate) ? value.estimate : undefined)
     setDisabledReason(typeof value.disabledReason === "string" ? value.disabledReason : undefined)
     setError(isTimelineError(value.error) ? value.error : undefined)
+    lastProgressChapters = parsed?.chapters.length
   }
 
   async function load(): Promise<void> {
@@ -96,6 +100,7 @@ export function createTimelineState(context: Context, sessionID: string): Timeli
   }
 
   async function start(method: "backfill" | "rebuild", confirm: boolean): Promise<StartResult> {
+    setProgress(undefined)
     try {
       await rpc[method]({ sessionID, confirm }, { location, signal: controller.signal })
       if (controller.signal.aborted) return { kind: "error", message: "Request aborted" }
@@ -138,7 +143,6 @@ export function createTimelineState(context: Context, sessionID: string): Timeli
   // Spec §10.2: refetch on `updated`, on `error`, and on `progress` when the
   // chapter count changes. The local progress signal renders live progress; a
   // chapter-count change also refetches so the timeline grows immediately.
-  let lastProgressChapters: number | undefined
   const offProgress = rpc.events.on(
     "progress",
     (event) => {

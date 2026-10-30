@@ -24,6 +24,11 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
   const selectedRow = createMemo(() => rows()[clampSelection(selected(), rows())])
 
   const paused = () => document()?.status === "paused"
+  const backfilling = () => document()?.status === "backfilling"
+  const backfillIncomplete = () => {
+    const backfill = document()?.backfill
+    return backfill !== null && backfill !== undefined && backfill.completedAt === undefined
+  }
   const hasRenderable = () => {
     const value = document()
     return value !== null && (value.watermark !== null || value.chapters.length > 0)
@@ -40,18 +45,44 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
     )
   }
   const errorMessage = () => state.error()?.message ?? document()?.meta.lastError?.message ?? "Recap update failed"
+  // A notice already explains the state (and often the action), so it replaces
+  // the generic stale badge. Rendering both as adjacent Show text nodes also
+  // overlaps them in the terminal layout.
+  const banner = () => {
+    const value = document()
+    const notice = value?.meta.notice
+    if (notice) return notice.message
+    if (value?.status === "stale") return "New activity — r to refresh"
+    return undefined
+  }
   const pausedAt = () => {
     const backfill = document()?.backfill
     return backfill ? `${backfill.processedMessages}/${backfill.totalMessages}` : "unknown"
   }
+  const progressValue = () => {
+    const live = state.progress()
+    if (live) return { processed: live.processed, total: live.total }
+    const backfill = document()?.backfill
+    if (backfill) return { processed: backfill.processedMessages, total: backfill.totalMessages }
+    return undefined
+  }
+  const progressBar = () => {
+    const value = progressValue()
+    if (!value) return ""
+    const width = 10
+    const total = Math.max(1, value.total)
+    const filled = Math.max(0, Math.min(width, Math.round((value.processed / total) * width)))
+    return `${"█".repeat(filled)}${"░".repeat(width - filled)} `
+  }
   const progressText = () => {
-    const value = state.progress()
+    const value = progressValue()
     if (!value) return "Building recap…"
-    return `Backfilling ${value.processed}/${value.total} messages`
+    return `${progressBar()}Backfilling ${value.processed}/${value.total} messages`
   }
   const footerHints = () => {
-    if (state.busy() || document()?.status === "backfilling") return "x cancel"
-    if (paused()) return "b resume   r refresh   x cancel"
+    if (backfilling()) return "x cancel"
+    if (paused()) return "b resume   x cancel"
+    if (state.busy()) return "updating…"
     return "j/k move   enter open   r refresh   b build/rebuild   x cancel   g/G first/last"
   }
 
@@ -80,7 +111,9 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
 
   createEffect(
     on(
-      () => [selected(), rows().length] as const,
+      // Track the scrollbox ref as well: it is assigned after the first render,
+      // so the initial selection would otherwise never scroll into view.
+      () => [selected(), rows().length, scroll()] as const,
       () => {
         const row = selectedRow()
         if (!row) return
@@ -127,11 +160,13 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
 
   async function refresh(): Promise<void> {
     const value = document()
-    if (state.busy() || value?.status === "backfilling") {
+    if (backfilling()) {
       props.context.ui.toast.show({ message: "Backfill in progress", variant: "info" })
       return
     }
-    if (paused() || (value?.backfill && value.backfill.completedAt === undefined)) {
+    // An incremental update may be running; `refresh` coalesces into it rather
+    // than being rejected, so `r` stays available outside a backfill.
+    if (backfillIncomplete()) {
       props.context.ui.toast.show({ message: "Resume the backfill with b", variant: "warning" })
       return
     }
@@ -145,8 +180,12 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
   function build(): void {
     const value = document()
     if (emptySession()) return
-    if (state.busy() || value?.status === "backfilling") {
+    if (backfilling()) {
       props.context.ui.toast.show({ message: "Backfill in progress", variant: "info" })
+      return
+    }
+    if (state.busy()) {
+      props.context.ui.toast.show({ message: "Recap update in progress", variant: "info" })
       return
     }
     // A rewritten transcript is not resumable; only a rebuild clears the notice.
@@ -248,10 +287,9 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
                       <TimelineHeader
                         context={props.context}
                         document={current()}
-                        busy={state.busy()}
                         disabled={Boolean(state.disabledReason())}
                       />
-                      <Show when={state.busy() || current().status === "backfilling"}>
+                      <Show when={backfilling()}>
                         <text fg={props.context.theme.text.feedback.info.base}>{progressText()} · x to cancel</text>
                       </Show>
                       <Show when={paused() && rows().length > 0}>
@@ -261,20 +299,12 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
                       </Show>
                       <Show when={current().status === "error" && rows().length > 0}>
                         <text fg={props.context.theme.text.feedback.error.base}>
-                          {errorMessage()} · b to resume/rebuild · r to retry
+                          {errorMessage()} · {backfillIncomplete() ? "b to resume" : "b to resume/rebuild · r to retry"}
                         </text>
                       </Show>
-                      <Show when={current().status === "stale"}>
-                        <text fg={props.context.theme.text.feedback.warning.base}>New activity — r to refresh</text>
-                      </Show>
-                      <Show when={current().meta.notice?.kind === "hourly-cap"}>
-                        <text fg={props.context.theme.text.feedback.warning.base}>
-                          {current().meta.notice?.message}
-                        </text>
-                      </Show>
-                      <Show when={current().meta.notice?.kind === "history-changed"}>
-                        <text fg={props.context.theme.text.feedback.warning.base}>
-                          {current().meta.notice?.message}
+                      <Show when={banner()}>
+                        <text fg={props.context.theme.text.feedback.warning.base} wrapMode="word">
+                          {banner()}
                         </text>
                       </Show>
                       <Show
@@ -388,7 +418,11 @@ function EmptyBody(props: {
     >
       <box flexDirection="column">
         <text fg={props.context.theme.text.feedback.error.base}>{props.errorMessage}</text>
-        <text fg={props.context.theme.text.muted}>b to resume/rebuild · r to retry</text>
+        <text fg={props.context.theme.text.muted}>
+          {props.document.backfill && props.document.backfill.completedAt === undefined
+            ? "b to resume"
+            : "b to resume/rebuild · r to retry"}
+        </text>
       </box>
     </Show>
   )

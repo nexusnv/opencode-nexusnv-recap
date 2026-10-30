@@ -147,12 +147,31 @@ describe("TimelinePanel states", () => {
         data: { sessionID: "ses_1", phase: "backfill", processed: 3, total: 10, chapters: 2 },
       })
       const frame = await app.waitForFrame((value) => value.includes("Backfilling 3/10 messages"))
+      expect(frame).toContain("█")
       expect(frame).toContain("x to cancel")
 
       await press(fake, "x")
       await drain()
 
       expect(methods(fake)).toContain("cancel")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("an incremental update keeps the ready status and r coalesces", async () => {
+    const document = readyDocument()
+    const { fake, app } = await mount({ ensure: async () => ({ document, busy: true }) })
+    try {
+      const frame = await app.waitForFrame((value) => value.includes("Newest chapter"))
+      expect(frame).toContain("READY")
+      expect(frame).not.toContain("BACKFILLING")
+      expect(frame).not.toContain("x to cancel")
+
+      await press(fake, "r")
+      await drain()
+
+      expect(methods(fake)).toContain("refresh")
     } finally {
       await app.dispose()
     }

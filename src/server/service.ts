@@ -74,6 +74,10 @@ export class TimelineService {
   async excerpt(sessionID: string, messageID: string): Promise<{ items: ReturnType<typeof buildExcerpt> }> {
     await this.engine.resolve(sessionID)
     const read = await readSessionMessages(this.ctx, sessionID)
+    // Re-check after the await: a session can be deleted while the transcript
+    // is being read. The read is still scoped to this session, so a message ID
+    // from another session cannot produce an excerpt.
+    await this.engine.resolve(sessionID)
     return { items: buildExcerpt(read.messages, messageID, this.parsed.config) }
   }
 }
