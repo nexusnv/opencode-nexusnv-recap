@@ -52,7 +52,14 @@ export function sanitizeError(error: unknown): string {
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message || error.name
-  if (isRecord(error) && typeof error.message === "string" && error.message.length > 0) return error.message
+  if (isRecord(error)) {
+    if (typeof error.message === "string" && error.message.length > 0) return error.message
+    // Effect/host errors are tagged records that may omit the message.
+    for (const key of ["name", "_tag"] as const) {
+      const value = error[key]
+      if (typeof value === "string" && value.length > 0) return value
+    }
+  }
   if (error === undefined || error === null) return ""
   return String(error)
 }

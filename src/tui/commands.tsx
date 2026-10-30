@@ -18,14 +18,16 @@ export function TimelineCommands(props: { readonly context: Context }) {
         // `/timeline` is a host command; use a distinct slash name.
         slash: { name: "recap" },
         run() {
-          const current = props.context.ui.panel.current()
-          if (current?.name === PANEL_NAME) {
-            props.context.ui.panel.close()
-            return
-          }
           const route = props.context.ui.router.current()
           if (route.type !== "session") {
             props.context.ui.toast.show({ message: "Open a session first", variant: "warning" })
+            return
+          }
+          const current = props.context.ui.panel.current()
+          // Only toggle the panel that belongs to this session. A panel left
+          // open on another session must not swallow the command here.
+          if (current?.name === PANEL_NAME && current.sessionID === route.sessionID) {
+            props.context.ui.panel.close()
             return
           }
           if (props.context.data.session.get(route.sessionID)?.parentID) {

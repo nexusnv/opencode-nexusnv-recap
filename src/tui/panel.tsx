@@ -81,7 +81,7 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
   }
   const footerHints = () => {
     if (backfilling()) return "x cancel"
-    if (paused()) return "b resume   x cancel"
+    if (paused()) return "b resume"
     if (state.busy()) return "updating…"
     return "j/k move   enter open   r refresh   b build/rebuild   x cancel   g/G first/last"
   }
@@ -160,6 +160,12 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
 
   async function refresh(): Promise<void> {
     const value = document()
+    // A failed initial load has no document to refresh; retry `ensure` so the
+    // "r to retry" hint actually retries the call that failed.
+    if (value === null) {
+      await state.load()
+      return
+    }
     if (backfilling()) {
       props.context.ui.toast.show({ message: "Backfill in progress", variant: "info" })
       return
@@ -411,7 +417,6 @@ function EmptyBody(props: {
             <text fg={props.context.theme.text.feedback.warning.base}>
               Backfill paused at {props.pausedAt} messages — b to resume.
             </text>
-            <text fg={props.context.theme.text.muted}>Press b to resume or r to retry.</text>
           </box>
         </Show>
       }

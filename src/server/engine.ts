@@ -879,13 +879,19 @@ export class TimelineEngine {
     followUp: () => Promise<void>,
   ): Promise<void> {
     let current = task
+    // A request can coalesce while the task waits for the lock (or while a
+    // prepared task is preparing). Capture that flag before clearing it so the
+    // acknowledged follow-up actually runs.
+    let rerun = runtime.rerun
     for (;;) {
       runtime.rerun = false
       await current()
-      if (!runtime.rerun || this.isInactive(sessionID)) break
+      if (this.isInactive(sessionID)) break
+      if (!rerun && !runtime.rerun) break
       const pending = runtime.followUp
       runtime.followUp = undefined
       current = pending ?? followUp
+      rerun = false
     }
   }
 

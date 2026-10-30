@@ -1218,4 +1218,43 @@ describe("TimelineEngine backfill concurrency and lifecycle hardening", () => {
     expect(h.modelCalls).toHaveLength(1)
     await h.engine.stop()
   })
+
+  test("a refresh coalesced while a rebuild prepares still runs", async () => {
+    const old = user(BASE_TIME - 60_000, "old")
+    const document = makeDocument({ watermark: watermarkOf(old), status: "ready" })
+    const releaseRead = deferred()
+    let reads = 0
+    let blocked = false
+    const h = createTestEngine({
+      messages: [old],
+      outputs: [chapterOutput("m1", "Rebuilt chapter")],
+      document,
+      config: { update: { minNewMessages: 1 } },
+      beforeContext: async () => {
+        reads += 1
+        if (blocked) return
+        blocked = true
+        await releaseRead.promise
+      },
+    })
+    await h.engine.start()
+
+    const rebuild = h.engine.rebuild(TEST_SESSION_ID, true)
+    await h.waitFor(() => blocked, "the rebuild prepare read")
+    const refresh = h.engine.refresh(TEST_SESSION_ID, "manual")
+    await h.drain()
+    releaseRead.resolve()
+
+    const rebuilt = await rebuild
+    expect(rebuilt.started).toBe(true)
+    expect(await refresh).toEqual({ started: false, coalesced: true })
+
+    await finish(h)
+    // Prepare read, post-completion tail read, and the coalesced refresh read.
+    expect(reads).toBe(3)
+    const stored = await storedDocument(h)
+    expect(stored.chapters.map((chapter) => chapter.title)).toEqual(["Rebuilt chapter"])
+    expect(h.modelCalls).toHaveLength(1)
+    await h.engine.stop()
+  })
 })

@@ -53,6 +53,9 @@ export function createTimelineState(context: Context, sessionID: string): Timeli
   // Seed from the loaded document so the first progress event can detect a
   // chapter-count change instead of being treated as the baseline.
   let lastProgressChapters: number | undefined
+  // Event-driven reloads can overlap. Only the newest request may apply its
+  // response; otherwise a slow, older `ensure` can overwrite a newer timeline.
+  let loadGeneration = 0
 
   function applyEnvelope(value: unknown): void {
     if (!isRecord(value)) throw new TypeError("Recap returned an invalid response")
@@ -75,18 +78,19 @@ export function createTimelineState(context: Context, sessionID: string): Timeli
   }
 
   async function load(): Promise<void> {
+    const generation = ++loadGeneration
     // Only the first load needs the full-screen loading state. Background
     // event reloads must not replace the visible timeline with a spinner.
     if (document() === null) setLoading(true)
     try {
       const result = await rpc.ensure({ sessionID }, { location, signal: controller.signal })
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted || generation !== loadGeneration) return
       applyEnvelope(result)
       setRequestError(undefined)
     } catch (cause) {
-      if (!controller.signal.aborted) setRequestError(messageOf(cause))
+      if (!controller.signal.aborted && generation === loadGeneration) setRequestError(messageOf(cause))
     } finally {
-      if (!controller.signal.aborted) setLoading(false)
+      if (!controller.signal.aborted && generation === loadGeneration) setLoading(false)
     }
   }
 
@@ -203,7 +207,7 @@ function rpcFailure(cause: unknown): { type?: string; message: string; data?: un
   if (isRecord(cause)) {
     return {
       ...(typeof cause.type === "string" ? { type: cause.type } : {}),
-      message: typeof cause.message === "string" ? cause.message : "Recap request failed",
+      message: messageOf(cause),
       data: cause.data,
     }
   }
@@ -250,5 +254,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function messageOf(cause: unknown): string {
-  return cause instanceof Error && cause.message ? cause.message : "Recap request failed"
+  if (cause instanceof Error && cause.message) return cause.message
+  // Host RPC errors are tagged records rather than native Errors.
+  if (isRecord(cause) && typeof cause.message === "string" && cause.message.length > 0) return cause.message
+  return "Recap request failed"
 }
