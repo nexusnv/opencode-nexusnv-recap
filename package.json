@@ -78,7 +78,7 @@
     }
   },
   "devDependencies": {
-    "@opencode/client": "2.1.4",
+    "@opencode/client": "2.2.0",
     "@opencode/plugin": "2.1.4",
     "@opencode/theme": "2.1.4",
     "@opentui/core": "0.6.8",
