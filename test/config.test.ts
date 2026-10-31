@@ -5,6 +5,7 @@ import {
   DEFAULT_DIGEST,
   DEFAULT_LIMITS,
   DEFAULT_UPDATE,
+  disabledConfigSnippet,
   disabledReasonFor,
   parseConfig,
 } from "../src/config"
@@ -114,6 +115,15 @@ describe("disabledReasonFor", () => {
     ).toBe("bad")
     expect(disabledReasonFor(parseConfig({ enabled: false }))).toBe("Recap is disabled.")
     expect(disabledReasonFor(parseConfig({}))).toContain("model")
+  })
+})
+
+describe("disabledConfigSnippet", () => {
+  test("adds the snippet only when it is needed and not already present", () => {
+    expect(disabledConfigSnippet(undefined)).toBeUndefined()
+    expect(disabledConfigSnippet("Recap is disabled.")).toBeUndefined()
+    expect(disabledConfigSnippet("Configured model is unavailable.")).toBe(CONFIG_SNIPPET)
+    expect(disabledConfigSnippet(`Recap requires an explicit model.\n${CONFIG_SNIPPET}`)).toBeUndefined()
   })
 })
 

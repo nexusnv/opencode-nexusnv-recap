@@ -1,6 +1,6 @@
 import type { SessionInfo, SessionMessageInfo } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
-import { CONFIG_SNIPPET, type TimelineConfig } from "../config.js"
+import { CONFIG_SNIPPET, DISABLED_REASON, type TimelineConfig } from "../config.js"
 import { createDocument } from "../shared/document.js"
 import type {
   TimelineBackfill,
@@ -27,16 +27,18 @@ import {
 import { ModelFailure, type ModelClient } from "./model.js"
 import { parseModelOutput, type ValidatedOutput } from "./output.js"
 import { PROMPT_VERSION, buildPrompt, buildRepairPrompt } from "./prompt.js"
-import { readSessionMessages } from "./read.js"
+import { readSessionMessages, type SessionPartialReason } from "./read.js"
 import type { TimelineStore } from "./store.js"
 import { isRecord } from "./text.js"
 import { sliceAfterWatermark } from "./watermark.js"
 
 export type RefreshReason = "idle" | "open" | "manual" | "force"
 
-const DISABLED_REASON = "Recap is disabled."
 const MISSING_MODEL_REASON = `Recap requires an explicit \`model\`.\n${CONFIG_SNIPPET}`
 const SHUTTING_DOWN_REASON = "Recap is shutting down."
+// Storage outages are usually transient. Automatic work backs off for a minute
+// so a broken store cannot turn panel reloads or idle events into a retry loop.
+const STORAGE_RETRY_DELAY_MS = 60_000
 
 type RemainingMessages = { kind: "messages"; messages: SessionMessageInfo[] } | { kind: "history-changed" }
 
@@ -52,9 +54,10 @@ function remainingMessages(
 
 /**
  * Drop trailing in-flight messages from a snapshot. A streaming assistant (no
- * `time.completed`, or a running tool part) and a running compaction are not
- * stable yet: advancing the watermark to them would permanently skip their
- * final content. The post-completion idle event processes them once settled.
+ * `time.completed`, or a running tool part), a running shell, and a running
+ * compaction are not stable yet: the host updates them in place, so advancing
+ * the watermark to them would permanently skip their final content. The
+ * post-completion idle event processes them once settled.
  */
 function settledMessages(messages: readonly SessionMessageInfo[]): SessionMessageInfo[] {
   let end = messages.length
@@ -71,6 +74,10 @@ function settledMessages(messages: readonly SessionMessageInfo[]): SessionMessag
         end -= 1
         continue
       }
+    }
+    if (message.type === "shell" && message.status === "running") {
+      end -= 1
+      continue
     }
     if (message.type === "compaction" && message.status === "running") {
       end -= 1
@@ -151,6 +158,8 @@ interface SessionRuntime {
   forceOnNextIdle: boolean
   backfill?: { cancelled: boolean } | undefined
   error?: TimelineError | undefined
+  /** Automatic retries stay paused until this instant after a storage failure. */
+  storageRetryAt?: number | undefined
   progress?: { phase: "backfill" | "update"; processed: number; total: number; chapters: number } | undefined
 }
 
@@ -378,6 +387,7 @@ export class TimelineEngine {
     const info = await this.deps.ctx.session.get({ sessionID }).catch(() => undefined)
     if (info?.time.idle !== undefined && info.time.idle < last.time.created) return true
     if (last.type === "user") return true
+    if (last.type === "shell" && last.status === "running") return true
     if (last.type === "assistant") {
       if (last.time.completed === undefined) return true
       if (
@@ -423,6 +433,10 @@ export class TimelineEngine {
     }
     if (this.deletedSessions.has(sessionID)) {
       if (manual) throw this.sessionNotFound(sessionID)
+      return { started: false, coalesced: false }
+    }
+    const runtime = this.runtime(sessionID)
+    if (!manual && runtime.storageRetryAt !== undefined && this.now() < runtime.storageRetryAt) {
       return { started: false, coalesced: false }
     }
     if (!document?.watermark) {
@@ -580,6 +594,7 @@ export class TimelineEngine {
         output: result.output,
         now: this.nowIso(),
         coveragePartial: read.partial,
+        ...(read.partialReason ? { coverageReason: read.partialReason } : {}),
         model: this.deps.config.model!,
         promptVersion: PROMPT_VERSION,
         log: this.log,
@@ -717,6 +732,7 @@ export class TimelineEngine {
       if (this.stopped) return
       const runtime = this.runtime(sessionID)
       delete runtime.error
+      delete runtime.storageRetryAt
     } catch (error) {
       if (this.isInactive(sessionID)) return
       const failure: TimelineError = {
@@ -725,11 +741,44 @@ export class TimelineEngine {
         retryable: true,
         kind: "storage",
       }
-      this.runtime(sessionID).error = failure
+      const runtime = this.runtime(sessionID)
+      runtime.error = failure
+      runtime.storageRetryAt = this.now() + STORAGE_RETRY_DELAY_MS
+      // The failed save may have been mutating a watermark or backfill state.
+      // Re-read the durable document and record only the error state, so a
+      // transient failure leaves the last committed chunk coherent.
+      await this.recordStorageFailure(sessionID, failure)
       // Abort the current run. Continuing would advance the in-memory watermark
       // past a chunk that was never durably saved, losing that chunk on retry.
       // The task loop reports the failure once; direct callers see the throw.
       throw new StorageFailure(failure.message)
+    }
+  }
+
+  /**
+   * Best-effort durable error status. This is separate from `persist` because
+   * the caller may still be rolling back an in-memory watermark or backfill
+   * counter after the failed write. Re-loading the last committed document
+   * avoids persisting that uncommitted state.
+   */
+  private async recordStorageFailure(sessionID: string, failure: TimelineError): Promise<void> {
+    if (this.isInactive(sessionID)) return
+    try {
+      const latest = await this.deps.store.load(sessionID)
+      if (this.isInactive(sessionID) || !latest) return
+      latest.status = "error"
+      latest.meta.lastCheckedAt = failure.at
+      latest.meta.lastError = failure
+      if (latest.backfill && latest.backfill.completedAt === undefined) {
+        latest.backfill.error = failure.message
+      }
+      await this.deps.store.save(latest, this.nowIso())
+      if (this.deletedSessions.has(sessionID)) {
+        await this.deps.store.remove(sessionID).catch(() => undefined)
+      }
+    } catch {
+      // The store is still unavailable. The runtime error remains visible and
+      // blocks automatic open refreshes until a manual retry succeeds.
     }
   }
 
@@ -989,6 +1038,9 @@ export class TimelineEngine {
     if (runtime.running) {
       return { document, busy: runtime.backfill !== undefined, needsBackfill: false }
     }
+    if (!document && runtime.error?.kind === "storage") {
+      return { document: null, busy: false, needsBackfill: false, error: runtime.error }
+    }
     if (!document) {
       const read = await readSessionMessages(this.deps.ctx, sessionID)
       const messages = settledMessages(read.messages)
@@ -1051,6 +1103,17 @@ export class TimelineEngine {
         busy: false,
         needsBackfill: false,
         ...(runtime.error ? { error: runtime.error } : {}),
+      }
+    }
+    // A failed error-state write leaves the stored document looking ready. Do
+    // not let the panel's error reload start another automatic model call; the
+    // user sees the runtime error and can retry with `r`.
+    if (runtime.error?.kind === "storage") {
+      return {
+        document,
+        busy: runtime.running !== null,
+        needsBackfill: false,
+        error: runtime.error,
       }
     }
     if (document.watermark === null) {
@@ -1326,7 +1389,7 @@ export class TimelineEngine {
         const target = document ?? this.newDocument(info)
         if (read.partial) {
           target.coverage.partial = true
-          target.coverage.reason = "compacted-history"
+          target.coverage.reason = read.partialReason ?? "compacted-history"
         }
         delete target.meta.notice
         // Resuming a backfill that has no remaining messages finalizes it rather
@@ -1348,7 +1411,7 @@ export class TimelineEngine {
       this.assertActive(sessionID)
       const target = document ?? this.newDocument(info)
       return {
-        run: () => this.runBackfill(sessionID, info, target, pending, read.partial, messages.length),
+        run: () => this.runBackfill(sessionID, info, target, pending, read.partialReason, messages.length),
         // Catch up on messages that arrived during the backfill in exactly one
         // forced pass; a threshold-skipped "open" refresh would leave them
         // pending until the next idle event.
@@ -1364,7 +1427,7 @@ export class TimelineEngine {
     info: SessionInfo,
     document: TimelineDocument,
     messages: readonly SessionMessageInfo[],
-    partial: boolean,
+    partialReason: SessionPartialReason | undefined,
     // `TimelineWatermark.messageCount` is a diagnostic (spec §5.1): the transcript
     // length of the read that produced this snapshot — never the cumulative
     // backfill total across resumes.
@@ -1385,9 +1448,9 @@ export class TimelineEngine {
     document.status = "backfilling"
     document.backfill = state
     delete document.meta.notice
-    if (partial) {
+    if (partialReason) {
       document.coverage.partial = true
-      document.coverage.reason = "compacted-history"
+      document.coverage.reason = partialReason
     }
     await this.persist(sessionID, document)
     if (this.isInactive(sessionID)) {
@@ -1465,7 +1528,8 @@ export class TimelineEngine {
       applyOutput(document, {
         output: result.output,
         now: this.nowIso(),
-        coveragePartial: partial,
+        coveragePartial: partialReason !== undefined,
+        ...(partialReason ? { coverageReason: partialReason } : {}),
         model: this.deps.config.model!,
         promptVersion: PROMPT_VERSION,
         log: this.log,
@@ -1590,7 +1654,7 @@ export class TimelineEngine {
       }
 
       return {
-        run: () => this.runBackfill(sessionID, info, document, messages, read.partial, messages.length),
+        run: () => this.runBackfill(sessionID, info, document, messages, read.partialReason, messages.length),
         // Catch up on messages that arrived during the backfill in exactly one
         // forced pass; a threshold-skipped "open" refresh would leave them
         // pending until the next idle event.

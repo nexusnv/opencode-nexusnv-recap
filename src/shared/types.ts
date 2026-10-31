@@ -84,9 +84,11 @@ export interface TimelineMeta {
   notice?: TimelineNotice | undefined
 }
 
+export type TimelineCoverageReason = "compacted-history" | "pagination-limit"
+
 export interface TimelineCoverage {
   partial: boolean
-  reason?: "compacted-history" | undefined
+  reason?: TimelineCoverageReason | undefined
 }
 
 export interface TimelineDocument {

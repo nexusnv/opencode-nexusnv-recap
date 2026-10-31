@@ -2,10 +2,13 @@ import type { SessionMessageInfo } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin"
 import { isRecord } from "./text.js"
 
+export type SessionPartialReason = "compacted-history" | "pagination-limit"
+
 export interface SessionRead {
   messages: SessionMessageInfo[]
   source: "full" | "context"
   partial: boolean
+  partialReason?: SessionPartialReason | undefined
 }
 
 interface FullPaginator {
@@ -20,7 +23,12 @@ export async function readSessionMessages(
   if (paginator?.list) {
     try {
       const page = await readAllPages(paginator.list.bind(paginator), sessionID)
-      return { messages: sortMessages(page.messages), source: "full", partial: !page.complete }
+      return {
+        messages: sortMessages(page.messages),
+        source: "full",
+        partial: !page.complete,
+        ...(page.complete ? {} : { partialReason: "pagination-limit" as const }),
+      }
     } catch {
       // Fall through to the documented context API.
     }
@@ -28,10 +36,12 @@ export async function readSessionMessages(
 
   const messages = await ctx.session.context({ sessionID })
   const sorted = sortMessages(messages)
+  const partial = isCompactionStart(sorted[0])
   return {
     messages: sorted,
     source: "context",
-    partial: isCompactionStart(sorted[0]),
+    partial,
+    ...(partial ? { partialReason: "compacted-history" as const } : {}),
   }
 }
 

@@ -2,7 +2,7 @@
 import type { ScrollBoxRenderable } from "@opentui/core"
 import type { Context, PanelInput } from "@opencode/plugin/tui/context"
 import { For, Show, createEffect, createMemo, createSignal, on, onMount } from "solid-js"
-import { CONFIG_SNIPPET } from "../config.js"
+import { disabledConfigSnippet } from "../config.js"
 import { PANEL_NAME } from "../shared/ids.js"
 import { ChapterRow, HighlightRow } from "./chapter.js"
 import { openExcerpt } from "./excerpt.js"
@@ -60,6 +60,7 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
     )
   }
   const errorMessage = () => state.error()?.message ?? document()?.meta.lastError?.message ?? "Recap update failed"
+  const disabledSnippet = () => disabledConfigSnippet(state.disabledReason())
   // A notice already explains the state (and often the action), so it replaces
   // the generic stale badge. Rendering both as adjacent Show text nodes also
   // overlaps them in the terminal layout.
@@ -276,7 +277,9 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
           fallback={
             <box flexDirection="column">
               <text fg={props.context.theme.text.muted}>{state.disabledReason()}</text>
-              <text fg={props.context.theme.text.muted}>{CONFIG_SNIPPET}</text>
+              <Show when={disabledSnippet()}>
+                <text fg={props.context.theme.text.muted}>{disabledSnippet()}</text>
+              </Show>
             </box>
           }
         >
@@ -331,9 +334,14 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
                           Backfill paused at {pausedAt()} messages — b to resume.
                         </text>
                       </Show>
-                      <Show when={current().status === "error" && rows().length > 0}>
+                      <Show when={(current().status === "error" || Boolean(state.error())) && rows().length > 0}>
                         <text fg={props.context.theme.text.feedback.error.base}>
-                          {errorMessage()} · {backfillIncomplete() ? "b to resume" : "b to resume/rebuild · r to retry"}
+                          {errorMessage()} ·{" "}
+                          {backfillIncomplete()
+                            ? "b to resume"
+                            : current().status === "error"
+                              ? "b to resume/rebuild · r to retry"
+                              : "r to retry"}
                         </text>
                       </Show>
                       <Show when={banner()}>
@@ -422,7 +430,7 @@ function EmptyBody(props: {
 }) {
   return (
     <Show
-      when={props.document.status === "error"}
+      when={props.document.status === "error" || Boolean(props.state.error())}
       fallback={
         <Show
           when={props.document.status === "paused"}
@@ -454,7 +462,9 @@ function EmptyBody(props: {
         <text fg={props.context.theme.text.muted}>
           {props.document.backfill && props.document.backfill.completedAt === undefined
             ? "b to resume"
-            : "b to resume/rebuild · r to retry"}
+            : props.document.status === "error"
+              ? "b to resume/rebuild · r to retry"
+              : "r to retry"}
         </text>
       </box>
     </Show>

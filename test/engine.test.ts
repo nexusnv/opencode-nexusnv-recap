@@ -24,6 +24,7 @@ function nextID(prefix: string): string {
 
 type UserMessage = Extract<SessionMessageInfo, { type: "user" }>
 type AssistantMessage = Extract<SessionMessageInfo, { type: "assistant" }>
+type ShellMessage = Extract<SessionMessageInfo, { type: "shell" }>
 type IdleMessage = Extract<SessionMessageInfo, { type: "idle" }>
 type CompactionMessage = Extract<SessionMessageInfo, { type: "compaction" }>
 
@@ -39,6 +40,19 @@ function assistant(created: number, options: { completed?: number | undefined } 
     agent: "build",
     model: { id: TEST_MODEL.modelID, providerID: TEST_MODEL.providerID },
     content: [{ type: "text", text: "done" }],
+  }
+}
+
+function shell(created: number, status: ShellMessage["status"] = "running", output = ""): ShellMessage {
+  return {
+    id: nextID("shell"),
+    time: { created, ...(status === "exited" ? { completed: created + 1_000 } : {}) },
+    type: "shell",
+    shellID: "sh_1",
+    command: "bun test",
+    status,
+    ...(status === "exited" ? { exit: 0 } : {}),
+    ...(output ? { output: { output, cursor: 0, size: output.length, truncated: false } } : {}),
   }
 }
 
@@ -743,6 +757,36 @@ describe("TimelineEngine model output handling", () => {
     await h.engine.stop()
   })
 
+  test("a trailing running shell is deferred until it exits", async () => {
+    const old = user(BASE_TIME - 120_000)
+    const running = shell(BASE_TIME)
+    const h = createTestEngine({
+      messages: [old, running],
+      outputs: [NOOP_OUTPUT],
+      document: makeDocument({ watermark: watermarkOf(old), status: "ready" }),
+      config: quickConfig(),
+    })
+    await h.engine.start()
+
+    await h.engine.refresh(TEST_SESSION_ID, "manual")
+    await finish(h)
+
+    expect(h.modelCalls).toHaveLength(0)
+    expect((await storedDocument(h)).watermark?.messageID).toBe(old.id)
+
+    running.status = "exited"
+    running.exit = 0
+    running.time.completed = BASE_TIME + 5_000
+    running.output = { output: "12 tests passed", cursor: 0, size: 15, truncated: false }
+    await h.engine.refresh(TEST_SESSION_ID, "manual")
+    await finish(h)
+
+    expect(h.modelCalls).toHaveLength(1)
+    expect(h.modelCalls[0]?.prompt).toContain("12 tests passed")
+    expect((await storedDocument(h)).watermark?.messageID).toBe(running.id)
+    await h.engine.stop()
+  })
+
   test("storage failures leave the durable watermark unchanged", async () => {
     const old = user(BASE_TIME - 120_000)
     const fresh = user(BASE_TIME)
@@ -762,8 +806,87 @@ describe("TimelineEngine model output handling", () => {
     const document = await storedDocument(h)
     expect(h.modelCalls).toHaveLength(1)
     expect(document.watermark?.messageID).toBe(old.id)
-    expect(document.status).toBe("ready")
+    expect(document.status).toBe("error")
+    expect(document.meta.lastError?.kind).toBe("storage")
+
+    // The background error event reloads through `ensure`. It must not start
+    // another automatic model call against the failed store.
+    const ensured = await h.engine.ensure(TEST_SESSION_ID)
+    expect(ensured.error?.kind).toBe("storage")
+    expect(h.modelCalls).toHaveLength(1)
     expect((await h.engine.get(TEST_SESSION_ID)).error?.kind).toBe("storage")
+    await h.engine.stop()
+  })
+
+  test("automatic refreshes back off for a minute after a storage failure", async () => {
+    const old = user(BASE_TIME - 120_000)
+    const fresh = user(BASE_TIME)
+    const reply = assistant(BASE_TIME + 1_000, { completed: BASE_TIME + 2_000 })
+    const h = createTestEngine({
+      messages: [old, fresh, reply],
+      outputs: [NOOP_OUTPUT, NOOP_OUTPUT],
+      document: makeDocument({ watermark: watermarkOf(old), status: "ready" }),
+      config: quickConfig(),
+    })
+    await h.engine.start()
+    h.storage.failSet = true
+
+    expect(await h.engine.refresh(TEST_SESSION_ID, "open")).toEqual({ started: true, coalesced: false })
+    await finish(h)
+    expect(h.modelCalls).toHaveLength(1)
+
+    expect(await h.engine.refresh(TEST_SESSION_ID, "open")).toEqual({ started: false, coalesced: false })
+    expect(h.modelCalls).toHaveLength(1)
+
+    h.storage.failSet = false
+    await h.clock.advance(60_000)
+    expect(await h.engine.refresh(TEST_SESSION_ID, "open")).toEqual({ started: true, coalesced: false })
+    await finish(h)
+
+    expect(h.modelCalls).toHaveLength(2)
+    expect((await storedDocument(h)).status).toBe("ready")
+    await h.engine.stop()
+  })
+
+  test("a persistent storage failure blocks the open-refresh retry loop and recovers on manual retry", async () => {
+    const old = user(BASE_TIME - 120_000)
+    const fresh = user(BASE_TIME)
+    const reply = assistant(BASE_TIME + 1_000, { completed: BASE_TIME + 2_000 })
+    const h = createTestEngine({
+      messages: [old, fresh, reply],
+      outputs: [NOOP_OUTPUT, NOOP_OUTPUT],
+      document: makeDocument({
+        watermark: watermarkOf(old),
+        status: "ready",
+        now: "2026-10-29T09:00:00.000Z",
+      }),
+      config: quickConfig(),
+    })
+    await h.engine.start()
+    h.storage.failSet = true
+
+    await h.engine.refresh(TEST_SESSION_ID, "manual")
+    await finish(h)
+
+    expect(h.modelCalls).toHaveLength(1)
+    const durable = await storedDocument(h)
+    expect(durable.status).toBe("ready")
+    expect(durable.watermark?.messageID).toBe(old.id)
+
+    const ensured = await h.engine.ensure(TEST_SESSION_ID)
+    expect(ensured.error?.kind).toBe("storage")
+    expect(ensured.busy).toBe(false)
+    expect(h.modelCalls).toHaveLength(1)
+
+    h.storage.failSet = false
+    await h.engine.refresh(TEST_SESSION_ID, "manual")
+    await finish(h)
+
+    expect(h.modelCalls).toHaveLength(2)
+    expect((await h.engine.get(TEST_SESSION_ID)).error).toBeUndefined()
+    const recovered = await storedDocument(h)
+    expect(recovered.status).toBe("ready")
+    expect(recovered.watermark?.messageID).toBe(reply.id)
     await h.engine.stop()
   })
 })

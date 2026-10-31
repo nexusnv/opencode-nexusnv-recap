@@ -43,7 +43,11 @@ export function TimelineHeader(props: {
         </text>
       </Show>
       <Show when={props.document.coverage.partial}>
-        <text fg={props.context.theme.text.feedback.warning.base}>Partial: earlier history was compacted.</text>
+        <text fg={props.context.theme.text.feedback.warning.base}>
+          {props.document.coverage.reason === "pagination-limit"
+            ? "Partial: transcript pagination limit reached."
+            : "Partial: earlier history was compacted."}
+        </text>
       </Show>
     </box>
   )

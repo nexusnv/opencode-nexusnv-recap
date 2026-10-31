@@ -62,6 +62,8 @@ export const DEFAULT_LIMITS: LimitsConfig = {
   retries: 2,
 }
 
+export const DISABLED_REASON = "Recap is disabled."
+
 export const CONFIG_SNIPPET = `{
   "plugins": [{
     "package": "opencode-nexusnv-recap",
@@ -70,6 +72,16 @@ export const CONFIG_SNIPPET = `{
     }
   }]
 }`
+
+/**
+ * The config snippet belongs in disabled states that need configuration, but
+ * not when recap is intentionally disabled and not twice when the reason
+ * already embeds it.
+ */
+export function disabledConfigSnippet(reason: string | undefined): string | undefined {
+  if (!reason || reason === DISABLED_REASON || reason.includes(CONFIG_SNIPPET)) return undefined
+  return CONFIG_SNIPPET
+}
 
 const modelSchema = z.strictObject({
   providerID: z.string().min(1),
@@ -153,7 +165,7 @@ export function formatConfigProblem(error: z.ZodError): string {
 
 export function disabledReasonFor(parsed: ParsedConfig): string | undefined {
   if (parsed.problem) return parsed.problem
-  if (!parsed.config.enabled) return "Recap is disabled."
+  if (!parsed.config.enabled) return DISABLED_REASON
   if (!parsed.config.model) return `Recap requires an explicit \`model\`.\n${CONFIG_SNIPPET}`
   return undefined
 }

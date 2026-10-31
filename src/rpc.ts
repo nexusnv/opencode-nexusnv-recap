@@ -162,7 +162,7 @@ const document = {
       type: "object",
       properties: {
         partial: { type: "boolean" },
-        reason: { type: "string", enum: ["compacted-history"] },
+        reason: { type: "string", enum: ["compacted-history", "pagination-limit"] },
       },
       required: ["partial"],
       additionalProperties: false,

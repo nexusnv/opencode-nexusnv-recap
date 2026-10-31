@@ -1,6 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import { describe, expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
+import { CONFIG_SNIPPET } from "../src/config"
 import { createDocument } from "../src/shared/document"
 import type { TimelineChapter, TimelineDocument, TimelineError, TimelineHighlight } from "../src/shared/types"
 import { TimelinePanel } from "../src/tui/panel"
@@ -261,6 +262,19 @@ describe("TimelinePanel states", () => {
     }
   })
 
+  test("a pagination-limited document explains the truncation", async () => {
+    const document = readyDocument()
+    document.coverage = { partial: true, reason: "pagination-limit" }
+    const { app } = await mount({ ensure: async () => ({ document, busy: false }) })
+    try {
+      const frame = await app.waitForFrame((value) => value.includes("pagination limit"))
+      expect(frame).toContain("Partial: transcript pagination limit reached.")
+      expect(frame).not.toContain("earlier history was compacted")
+    } finally {
+      await app.dispose()
+    }
+  })
+
   test("a built document without chapters shows the no-milestones message", async () => {
     const document = readyDocument()
     document.chapters = []
@@ -352,6 +366,52 @@ describe("TimelinePanel states", () => {
     }
   })
 
+  test("a runtime storage error is visible on a ready document and r retries", async () => {
+    const document = readyDocument()
+    const { fake, app } = await mount({
+      ensure: async () => ({
+        document,
+        busy: false,
+        error: { message: "disk full", at: NOW, retryable: true, kind: "storage" },
+      }),
+    })
+    try {
+      const frame = await app.waitForFrame((value) => value.includes("disk full"))
+      expect(frame).toContain("disk full")
+      expect(frame).toContain("r to retry")
+      expect(frame).toContain("Newest chapter")
+
+      await press(fake, "r")
+      await drain()
+      expect(methods(fake)).toContain("refresh")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a runtime storage error with no rows replaces the empty body", async () => {
+    const document = readyDocument()
+    document.chapters = []
+    const { fake, app } = await mount({
+      ensure: async () => ({
+        document,
+        busy: false,
+        error: { message: "disk full", at: NOW, retryable: true, kind: "storage" },
+      }),
+    })
+    try {
+      const frame = await app.waitForFrame((value) => value.includes("disk full"))
+      expect(frame).toContain("r to retry")
+      expect(frame).not.toContain("No milestones found yet")
+
+      await press(fake, "r")
+      await drain()
+      expect(methods(fake)).toContain("refresh")
+    } finally {
+      await app.dispose()
+    }
+  })
+
   test("a transport error keeps a renderable timeline and shows a banner", async () => {
     let calls = 0
     const { fake, app } = await mount({
@@ -418,14 +478,27 @@ describe("TimelinePanel states", () => {
     }
   })
 
-  test("a disabled engine shows the reason and config snippet without other calls", async () => {
+  test("an intentionally disabled engine does not show a config snippet", async () => {
     const { fake, app } = await mount({
       ensure: async () => ({ document: null, busy: false, disabledReason: "Recap is disabled." }),
     })
     try {
       const frame = await app.waitForFrame((value) => value.includes("Recap is disabled."))
-      expect(frame).toContain("opencode-nexusnv-recap")
+      expect(frame).not.toContain("opencode-nexusnv-recap")
       expect(methods(fake)).toEqual(["ensure"])
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a missing-model disabled state shows the config snippet once", async () => {
+    const reason = `Recap requires an explicit \`model\`.\n${CONFIG_SNIPPET}`
+    const { app } = await mount({
+      ensure: async () => ({ document: null, busy: false, disabledReason: reason }),
+    })
+    try {
+      const frame = await app.waitForFrame((value) => value.includes("Recap requires an explicit"))
+      expect(frame.split("opencode-nexusnv-recap").length - 1).toBe(1)
     } finally {
       await app.dispose()
     }

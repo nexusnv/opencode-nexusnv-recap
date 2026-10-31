@@ -55,6 +55,17 @@ function shell(command: string, exit: number, output: string): SessionMessageInf
   }
 }
 
+function runningShell(command: string): SessionMessageInfo {
+  return {
+    id: id("shell"),
+    time: { created: BASE_TIME },
+    type: "shell",
+    shellID: "sh_1",
+    command,
+    status: "running",
+  }
+}
+
 describe("buildEvidence", () => {
   test("collects files touched from edit, write, and patch", () => {
     const evidence = buildEvidence(
@@ -93,6 +104,13 @@ describe("buildEvidence", () => {
     expect(checks).toContain("bun run typecheck passed")
     expect(checks).toContain("bun run build failed")
     expect(checks).not.toContain("cat package.json")
+  })
+
+  test("does not claim a running shell check passed or failed", () => {
+    const evidence = buildEvidence([runningShell("bun test")], config())
+
+    expect(evidence).toContain("Commands: bun test")
+    expect(evidence).not.toContain("Checks:")
   })
 
   test("collects PR, commit, gh, and git references", () => {

@@ -29,7 +29,9 @@ export function buildEvidence(messages: readonly SessionMessageInfo[], config: T
     if (message.type === "shell") {
       commands.add(clip(message.command, 160))
       collectRefs(message.command, refs)
-      if (isCheckCommand(message.command)) {
+      // A running shell has no outcome yet. Recording it as failed would be
+      // wrong, and recording it as passed would be premature.
+      if (message.status !== "running" && isCheckCommand(message.command)) {
         const passed = message.status === "exited" && message.exit === 0
         checks.set(clip(message.command, 120), passed ? "passed" : "failed")
       }

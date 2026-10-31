@@ -194,7 +194,7 @@ type TimelineDocument = {
   sessionTitle: string | null
   goal: string | null
   status: TimelineStatus
-  coverage: { partial: boolean; reason?: "compacted-history" }
+  coverage: { partial: boolean; reason?: "compacted-history" | "pagination-limit" }
   tasks: TimelineTask[]
   chapters: TimelineChapter[]
   watermark: TimelineWatermark | null
@@ -211,7 +211,7 @@ type TimelineDocument = {
 - `highlights` are append-only within a chapter. Text may not be rewritten.
 - `watermark` advances only after a batch has been validated, applied, and persisted atomically in one document write. `meta.updatedAt` is set on every successful write.
 - `status` is the only persisted state that describes freshness. `stale` means "new messages are pending but the last update succeeded"; `error` means "the last attempt failed and the watermark did not move." `disabled` is runtime-only and never written to the document.
-- `coverage.partial` is true when the available history starts at a compaction boundary. Incremental updates may set it to true; only a full rebuild may clear it, and only when full history is actually available.
+- `coverage.partial` is true when the available history is incomplete. `reason` distinguishes a compaction boundary from the paginator's safety cap. Incremental updates may set it to true; only a full rebuild may clear it, and only when full history is actually available.
 - `tasks` is a ledger, not an append-only log. It is replaced when the model returns a new list, with stable-key reconciliation.
 - The status header is derived:
   - Goal: `goal`
@@ -237,9 +237,9 @@ type TimelineDocument = {
 1. Prefer a full-history paginator if the running plugin API exposes one (`ctx.session.message.list`). This is capability-checked at runtime; it is not assumed.
 2. Otherwise use `ctx.session.context({ sessionID })`, which returns only messages after the last compaction.
 3. Sort ascending by `time.created`, stable for equal timestamps.
-4. Return `{ messages, source: "full" | "context", partial }`.
+4. Return `{ messages, source: "full" | "context", partial, partialReason }`.
 
-`partial` is true when the source is `context` and the first message is a compaction message. If the runtime exposes a compaction boundary or timestamp, use that instead of the first-message heuristic. The compaction summary is still included in the digest as background.
+`partial` is true when the source is `context` and the first message is a compaction message, or when the full paginator reaches its 200-page safety cap without terminating. `partialReason` distinguishes `"compacted-history"` from `"pagination-limit"` so the panel does not claim that paginator truncation was compaction. If the runtime exposes a compaction boundary or timestamp, use that instead of the first-message heuristic. The compaction summary is still included in the digest as background.
 
 For incremental updates, `context` is sufficient. If the watermark is missing from it, the engine tries full history (when available) before falling back to a time-based slice. If the compaction summary itself is not present in `context`, coverage is still marked partial when the runtime reports a compaction; the plugin does not claim to have the missing background.
 

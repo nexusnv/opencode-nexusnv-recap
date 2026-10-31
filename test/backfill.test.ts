@@ -770,7 +770,9 @@ describe("TimelineEngine backfill concurrency and lifecycle hardening", () => {
 
     const failed = await storedDocument(h)
     expect(failed.watermark?.messageID).toBe(first.id)
-    expect(failed.status).toBe("backfilling")
+    expect(failed.status).toBe("error")
+    expect(failed.backfill?.error).toContain("disk full")
+    expect(failed.meta.lastError?.kind).toBe("storage")
     expect(failed.chapters).toHaveLength(1)
     expect(h.events.some((event) => event.type === "error" && event.data.kind === "storage")).toBe(true)
     expect((await h.engine.get(TEST_SESSION_ID)).error?.kind).toBe("storage")

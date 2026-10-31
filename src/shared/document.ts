@@ -77,7 +77,7 @@ export const timelineDocumentSchema: z.ZodType<TimelineDocument> = z.strictObjec
   status: statusSchema,
   coverage: z.strictObject({
     partial: z.boolean(),
-    reason: z.enum(["compacted-history"]).optional(),
+    reason: z.enum(["compacted-history", "pagination-limit"]).optional(),
   }),
   tasks: z.array(
     z.strictObject({

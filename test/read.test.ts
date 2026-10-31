@@ -146,6 +146,7 @@ describe("readSessionMessages", () => {
 
     expect(read.source).toBe("context")
     expect(read.partial).toBe(true)
+    expect(read.partialReason).toBe("compacted-history")
     expect(read.messages.map((message) => message.id)).toEqual([summary.id, after.id])
   })
 
@@ -157,9 +158,10 @@ describe("readSessionMessages", () => {
 
     expect(read.source).toBe("full")
     expect(read.partial).toBe(false)
+    expect(read.partialReason).toBeUndefined()
   })
 
-  test("reports partial coverage when pagination hits the 200-page safety cap", async () => {
+  test("reports pagination truncation when the 200-page safety cap is hit", async () => {
     let calls = 0
     const list = async (): Promise<unknown> => {
       calls += 1
@@ -172,6 +174,7 @@ describe("readSessionMessages", () => {
     expect(calls).toBe(200)
     expect(read.source).toBe("full")
     expect(read.partial).toBe(true)
+    expect(read.partialReason).toBe("pagination-limit")
     expect(read.messages).toHaveLength(200)
   })
 

@@ -723,6 +723,14 @@ describe("applyOutput coverage and meta", () => {
     expect(document.coverage).toStrictEqual({ partial: true, reason: "compacted-history" })
   })
 
+  test("records pagination truncation instead of claiming compaction", () => {
+    const document = documentWith()
+
+    apply(document, output(), { coveragePartial: true, coverageReason: "pagination-limit" })
+
+    expect(document.coverage).toStrictEqual({ partial: true, reason: "pagination-limit" })
+  })
+
   test("never clears coverage.partial", () => {
     const document = documentWith({ coverage: { partial: true, reason: "compacted-history" } })
 

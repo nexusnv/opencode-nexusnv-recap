@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type {
   TimelineChapter,
+  TimelineCoverageReason,
   TimelineDocument,
   TimelineHighlight,
   TimelineHighlightArtifact,
@@ -16,6 +17,7 @@ export interface ApplyInput {
   output: ValidatedOutput
   now: string
   coveragePartial: boolean
+  coverageReason?: TimelineCoverageReason | undefined
   model: TimelineModelRef
   promptVersion: number
   /** Optional engine logger; logs IDs only, never prompt or message content. */
@@ -30,7 +32,7 @@ export function applyOutput(document: TimelineDocument, input: ApplyInput): void
 
   if (input.coveragePartial) {
     document.coverage.partial = true
-    document.coverage.reason = "compacted-history"
+    document.coverage.reason = input.coverageReason ?? "compacted-history"
   }
   document.meta.model = { ...input.model }
   document.meta.promptVersion = input.promptVersion
