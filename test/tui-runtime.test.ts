@@ -26,9 +26,9 @@ function sourceFiles(path: string): string[] {
   })
 }
 
-test("TUI state uses .tsx so the host Solid transform applies", async () => {
-  expect(await file("src/tui/state.ts").exists()).toBe(false)
-  expect(await file("src/tui/state.tsx").exists()).toBe(true)
+test("TUI sidebar state uses .tsx so the host Solid transform applies", async () => {
+  expect(await file("src/tui/sidebar-state.ts").exists()).toBe(false)
+  expect(await file("src/tui/sidebar-state.tsx").exists()).toBe(true)
 })
 
 test("host runtime matcher allows type-only imports", () => {

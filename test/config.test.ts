@@ -56,7 +56,7 @@ describe("parseConfig", () => {
     const { config, problem } = parseConfig({})
     expect(problem).toContain("model")
     expect(problem).toContain(CONFIG_SNIPPET)
-    // The parsed defaults are still returned so the panel can show shared values.
+    // The parsed defaults are still returned so the sidebar can show shared values.
     expect(config.enabled).toBe(true)
   })
 

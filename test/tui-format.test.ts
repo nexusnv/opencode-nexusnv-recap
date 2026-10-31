@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test"
-import type { TimelineStatus } from "../src/shared/types"
+import type { Context } from "@opencode/plugin/tui/context"
+import type { TimelineHighlight, TimelineHighlightKind } from "../src/shared/types"
 import {
-  artifactSummary,
-  chapterRange,
+  compactChapterRange,
   glyph,
+  kindColor,
   relativeTime,
   statusColor,
-  statusLabel,
+  statusWord,
   taskSummary,
 } from "../src/tui/format"
 import { fakeTui } from "./helpers/tui"
@@ -27,50 +28,6 @@ describe("relativeTime", () => {
   })
 })
 
-describe("chapterRange", () => {
-  test("formats a same-day range", () => {
-    const start = new Date(2026, 9, 29, 10, 0)
-    const end = new Date(2026, 9, 29, 11, 30)
-
-    expect(chapterRange(start.toISOString(), end.toISOString())).toBe("10:00–11:30")
-  })
-
-  test("formats a cross-day range", () => {
-    const start = new Date(2026, 9, 29, 23, 0)
-    const end = new Date(2026, 9, 30, 1, 15)
-    const range = chapterRange(start.toISOString(), end.toISOString())
-
-    expect(range).toContain(start.toLocaleDateString())
-    expect(range).toContain(end.toLocaleDateString())
-    expect(range).toContain("23:00")
-    expect(range).toContain("01:15")
-  })
-
-  test("returns unknown for invalid dates", () => {
-    expect(chapterRange("nope", "also-nope")).toBe("unknown")
-  })
-})
-
-describe("statusLabel", () => {
-  test("labels every persisted status", () => {
-    const statuses: TimelineStatus[] = ["empty", "backfilling", "paused", "ready", "stale", "error"]
-    expect(statuses.map((status) => statusLabel(status, false, false))).toEqual([
-      "EMPTY",
-      "BACKFILLING",
-      "PAUSED",
-      "READY",
-      "STALE",
-      "ERROR",
-    ])
-  })
-
-  test("disabled and busy override the persisted status", () => {
-    expect(statusLabel("ready", true, false)).toBe("DISABLED")
-    expect(statusLabel("ready", false, true)).toBe("BACKFILLING")
-    expect(statusLabel("error", true, true)).toBe("DISABLED")
-  })
-})
-
 describe("statusColor", () => {
   const { context } = fakeTui()
 
@@ -83,6 +40,94 @@ describe("statusColor", () => {
     expect(statusColor(context, "empty", false, false)).toBe(context.theme.text.muted)
     expect(statusColor(context, "ready", true, false)).toBe(context.theme.text.muted)
     expect(statusColor(context, "ready", false, true)).toBe(context.theme.text.feedback.info.base)
+  })
+})
+
+describe("compactChapterRange", () => {
+  test("formats a same-day range", () => {
+    const start = new Date(2026, 9, 29, 10, 0)
+    const end = new Date(2026, 9, 29, 11, 30)
+
+    expect(compactChapterRange(start.toISOString(), end.toISOString())).toBe("10:00–11:30")
+  })
+
+  test("uses only the start date and time for a cross-day range", () => {
+    const start = new Date(2026, 9, 29, 23, 0)
+    const end = new Date(2026, 9, 30, 1, 15)
+
+    expect(compactChapterRange(start.toISOString(), end.toISOString())).toBe("10/29 23:00")
+  })
+
+  test("returns unknown for invalid dates", () => {
+    expect(compactChapterRange("nope", "also-nope")).toBe("unknown")
+  })
+})
+
+describe("statusWord", () => {
+  test("omits ready and labels the other states", () => {
+    expect(statusWord("ready", false, false)).toBeUndefined()
+    expect(statusWord("stale", false, false)).toBe("stale")
+    expect(statusWord("paused", false, false)).toBe("paused")
+    expect(statusWord("error", false, false)).toBe("error")
+    expect(statusWord("backfilling", false, false)).toBe("building")
+    expect(statusWord("empty", false, false)).toBe("not built")
+  })
+
+  test("lets disabled and a generic busy state override the status", () => {
+    expect(statusWord("ready", true, false)).toBe("disabled")
+    expect(statusWord("ready", false, true)).toBe("updating")
+    expect(statusWord("backfilling", false, true)).toBe("building")
+  })
+})
+
+describe("kindColor", () => {
+  const context = {
+    theme: {
+      text: {
+        base: "#base",
+        muted: "#muted",
+        faint: "#faint",
+        action: { primary: { base: "#action" } },
+        feedback: {
+          warning: { base: "#warning", muted: "#warning-muted" },
+          success: { base: "#success", muted: "#success-muted" },
+          error: { base: "#error", muted: "#error-muted" },
+          info: { base: "#info", muted: "#info-muted" },
+        },
+      },
+    },
+  } as unknown as Context
+
+  function color(kind: TimelineHighlightKind, overrides: Partial<TimelineHighlight> = {}): string {
+    return kindColor(context, {
+      id: "hl_1",
+      kind,
+      text: "Text",
+      at: "2026-10-29T10:00:00.000Z",
+      anchorMessageID: "msg_1",
+      ...overrides,
+    }) as unknown as string
+  }
+
+  test("maps decisions, implementations, and notes", () => {
+    expect(color("decision")).toBe("#warning")
+    expect(color("implementation")).toBe("#action")
+    expect(color("note")).toBe("#muted")
+  })
+
+  test("maps task statuses", () => {
+    expect(color("task", { task: { key: "t", status: "done" } })).toBe("#success")
+    expect(color("task", { task: { key: "t", status: "open" } })).toBe("#warning")
+    expect(color("task", { task: { key: "t", status: "blocked" } })).toBe("#error")
+    expect(color("task")).toBe("#warning")
+  })
+
+  test("maps artifacts and plans", () => {
+    expect(color("pr", { artifact: { type: "pr", state: "opened" } })).toBe("#action")
+    expect(color("pr", { artifact: { type: "pr", state: "merged" } })).toBe("#action")
+    expect(color("commit", { artifact: { type: "commit" } })).toBe("#action")
+    expect(color("issue")).toBe("#warning")
+    expect(color("plan")).toBe("#info")
   })
 })
 
@@ -117,18 +162,6 @@ describe("taskSummary", () => {
   test("falls back to counts when titles are unavailable", () => {
     expect(taskSummary({ total: 3, done: 1, open: 2, blocked: 1, openTitles: [], blockedTitles: [] })).toBe(
       "1/3 done   open: 2   blocked: 1",
-    )
-  })
-})
-
-describe("artifactSummary", () => {
-  test("handles no artifacts", () => {
-    expect(artifactSummary([])).toBe("None")
-  })
-
-  test("lists PR states and commits", () => {
-    expect(artifactSummary([{ label: "PR #12", state: "merged" }, { label: "commit abc1234" }])).toBe(
-      "PR #12 merged; commit abc1234",
     )
   })
 })

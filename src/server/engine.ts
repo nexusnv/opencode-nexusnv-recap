@@ -37,7 +37,7 @@ export type RefreshReason = "idle" | "open" | "manual" | "force"
 const MISSING_MODEL_REASON = `Recap requires an explicit \`model\`.\n${CONFIG_SNIPPET}`
 const SHUTTING_DOWN_REASON = "Recap is shutting down."
 // Storage outages are usually transient. Automatic work backs off for a minute
-// so a broken store cannot turn panel reloads or idle events into a retry loop.
+// so a broken store cannot turn sidebar reloads or idle events into a retry loop.
 const STORAGE_RETRY_DELAY_MS = 60_000
 
 type RemainingMessages = { kind: "messages"; messages: SessionMessageInfo[] } | { kind: "history-changed" }
@@ -822,7 +822,7 @@ export class TimelineEngine {
         throw this.sessionNotFound(sessionID)
       }
       // A transport or host failure is not a missing session; keep the
-      // distinction so the panel can offer a retry instead of a dead end.
+      // distinction so the sidebar can offer a retry instead of a dead end.
       throw new TimelineFailure("internal", sanitizeError(error))
     }
     this.assertNotDeleted(sessionID)
@@ -1031,10 +1031,10 @@ export class TimelineEngine {
         needsBackfill: false,
       }
     }
-    // The panel calls `ensure` right after starting a build. Do not treat that
-    // in-flight job as a fresh auto-start opportunity (it would throw "busy").
-    // A normal incremental update keeps the current document visible as ready;
-    // only a backfill needs the blocking progress state.
+    // A caller may call `ensure` right after starting a build. Do not treat
+    // that in-flight job as a fresh auto-start opportunity (it would throw
+    // "busy"). A normal incremental update keeps the current document visible
+    // as ready; only a backfill needs the blocking progress state.
     if (runtime.running) {
       return { document, busy: runtime.backfill !== undefined, needsBackfill: false }
     }
@@ -1106,8 +1106,8 @@ export class TimelineEngine {
       }
     }
     // A failed error-state write leaves the stored document looking ready. Do
-    // not let the panel's error reload start another automatic model call; the
-    // user sees the runtime error and can retry with `r`.
+    // not let the sidebar's error reload start another automatic model call;
+    // the user sees the runtime error and can retry from `/recap`.
     if (runtime.error?.kind === "storage") {
       return {
         document,
@@ -1146,7 +1146,7 @@ export class TimelineEngine {
       const messages = settledMessages(read.messages)
       const slice = sliceAfterWatermark(messages, watermark)
       if (slice.kind === "new") {
-        // The panel should render the current document immediately; the refresh
+        // The sidebar should render the current document immediately; the refresh
         // runs in the background and reports through events.
         void this.refresh(sessionID, "open").catch((error) => {
           this.log("open refresh failed", { sessionID, error: sanitizeError(error) })
@@ -1196,7 +1196,7 @@ export class TimelineEngine {
         }
       }
       // The due check found nothing to process. Record the check so repeated
-      // panel opens do not re-read the whole transcript until the interval
+      // sidebar opens do not re-read the whole transcript until the interval
       // elapses again. A partial (compacted) history change is also a no-op:
       // the timestamp fallback resumes on the next settled message.
       if (slice.kind === "empty" || (slice.kind === "history-changed" && read.partial)) {

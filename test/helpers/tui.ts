@@ -1,4 +1,4 @@
-import type { Context, KeymapCommand, KeymapLayer, PanelInput } from "@opencode/plugin/tui/context"
+import type { Context, KeymapCommand, KeymapLayer } from "@opencode/plugin/tui/context"
 import { createSignal } from "solid-js"
 
 export interface FakeRpc {
@@ -16,30 +16,28 @@ export interface FakeRpc {
 }
 
 export interface FakeUiCalls {
-  readonly panelOpen: Array<{ name: string; options: unknown }>
-  readonly panelClose: number
   readonly toasts: unknown[]
   readonly confirms: unknown[]
+  readonly selects: unknown[]
   readonly dialogs: number
   readonly dialogSet: unknown[]
 }
 
 export interface FakeTuiOptions {
   readonly session?: Record<string, unknown>
-  readonly currentPanel?: PanelInput | undefined
   readonly route?: unknown
+  readonly select?: (options: unknown) => unknown | Promise<unknown>
 }
 
 export function fakeTui(overrides: Partial<FakeRpc> = {}, options: FakeTuiOptions = {}) {
   const calls: Array<{ method: string; input: unknown; options: unknown }> = []
   const uiCalls: {
-    panelOpen: Array<{ name: string; options: unknown }>
-    panelClose: number
     toasts: unknown[]
     confirms: unknown[]
+    selects: unknown[]
     dialogs: number
     dialogSet: unknown[]
-  } = { panelOpen: [], panelClose: 0, toasts: [], confirms: [], dialogs: 0, dialogSet: [] }
+  } = { toasts: [], confirms: [], selects: [], dialogs: 0, dialogSet: [] }
   const handlers = new Map<string, Array<(event: { data: Record<string, unknown> }) => void>>()
   const layers: Array<() => KeymapLayer> = []
   const record =
@@ -111,16 +109,6 @@ export function fakeTui(overrides: Partial<FakeRpc> = {}, options: FakeTuiOption
       mode: { current: () => "base", push: () => () => undefined },
     },
     ui: {
-      panel: {
-        open: (name: string, openOptions?: unknown) => {
-          uiCalls.panelOpen.push({ name, options: openOptions })
-          return true
-        },
-        close: () => {
-          uiCalls.panelClose += 1
-        },
-        current: () => options.currentPanel,
-      },
       toast: {
         show: (input: unknown) => {
           uiCalls.toasts.push(input)
@@ -136,7 +124,10 @@ export function fakeTui(overrides: Partial<FakeRpc> = {}, options: FakeTuiOption
         clear: () => undefined,
         alert: async () => undefined,
         prompt: async () => undefined,
-        select: async () => undefined,
+        select: async (input: unknown) => {
+          uiCalls.selects.push(input)
+          return options.select ? await options.select(input) : undefined
+        },
         confirm: async (input: unknown) => {
           uiCalls.confirms.push(input)
           return true
@@ -177,18 +168,4 @@ function fakeTheme(): Context["theme"] {
     },
     background: { raised: { base: color } },
   } as unknown as Context["theme"]
-}
-
-export function panelInput(overrides: Partial<PanelInput> = {}): PanelInput {
-  return {
-    name: "timeline",
-    sessionID: "ses_1",
-    width: 100,
-    presentation: "panel",
-    focused: true,
-    focus() {},
-    close() {},
-    toggleFullscreen() {},
-    ...overrides,
-  }
 }

@@ -1,23 +1,17 @@
 # OpenCode Nexusnv Recap
 
-Recap turns a long OpenCode session into a short, chronological highlight reel. It answers the questions you actually have when you come back to a session: what was this trying to do, what was decided, what was implemented, which tasks are still open, and which PRs or commits came out of it.
+Recap turns a long OpenCode session into a short, chronological highlight reel. It answers the questions you actually have when you come back to a session: what was this trying to do, what was decided, what was implemented, which tasks are still open, which PRs or commits came out of it, and what it plans to do next.
 
 It is built for OpenCode V2. The server owns the model calls and the durable timeline; the TUI is a thin view and control surface. The plugin never prompts, compacts, edits, or interrupts the session.
 
 ```text
-Recap                                     READY · 2m ago · gpt-5-mini
-Goal  Add a session timeline plugin for OpenCode
-Tasks 3/7 done   open: TUI panel, backfill, tests
-Decisions  server-owned engine; append-only chapters
-Artifacts  PR #42 opened
-
-10:12–10:38  Built the server engine                 3 highlights  ▾
-  ◆ Decision  Timeline is append-only
-  ✦ Impl      Watermark + digest pipeline
-  ✓ Task      Engine tests passing
-10:40–11:05  TUI panel                               2 highlights  ▸
-11:07–11:20  Backfill + failure handling             4 highlights  ▸
+Recap                                        1/3
+▸ Built the server engine · 10:12–10:38
+Now Backfill + failure handling · ✦ Engine tests passing
+Next → add Markdown export
 ```
+
+The sidebar is a compact table of contents for the session. It shows one chapter at a time, the current chapter with its latest highlight, and the newest explicit plan. Every line that overflows scrolls horizontally instead of truncating, so narrow sidebars stay readable without ellipses.
 
 ## Install
 
@@ -61,33 +55,27 @@ Add the package as a plugin and configure an explicit model:
 }
 ```
 
-**The model is required and there is no fallback.** If `model` is missing, the plugin loads but the engine stays disabled and the panel shows the configuration snippet. It never silently uses the session's model. A configured model is checked against `ctx.model.list()` at setup and again on first use; a missing model is a visible disabled state, not a surprise bill.
+**The model is required and there is no fallback.** If `model` is missing, the plugin loads but the engine stays disabled and the sidebar shows the configuration snippet. It never silently uses the session's model. A configured model is checked against `ctx.model.list()` at setup and again on first use; a missing model is a visible disabled state, not a surprise bill.
 
 Unknown configuration keys are rejected so typos are caught early. A malformed configuration disables the engine with the reason and the required snippet.
 
 ## Usage
 
-- Run `/recap` in a root session, or use the **Open session recap** entry in the command palette.
-- On a session with no timeline yet, the panel shows the message count and approximate model calls. Press `b` to build it.
-- Large backfills ask for confirmation first. Backfill progress is shown in the panel and continues while the panel is closed.
-- New activity marks the timeline stale. Press `r` to refresh; automatic updates also run after the session goes idle, subject to the hourly cap.
+The sidebar appears automatically for root sessions. It never starts a model call when it mounts: it only reads the stored recap. Mounting is free.
+
+Run `/recap` in a root session, or use the **Recap actions** entry in the command palette. The menu offers the actions that apply to the current document:
+
+- **Build** — build a recap from session history.
+- **Resume** — continue a paused or interrupted backfill.
+- **Refresh** — fold new activity into an existing recap.
+- **Rebuild** — discard the recap and rebuild from history.
+- **Cancel** — stop a running build.
+
+Large backfills ask for confirmation first. Backfill progress replaces the `Next` line while it runs, and continues while the sidebar is closed. New activity marks the recap stale; the header says `stale`, and **Refresh** catches up. Automatic updates also run after the session goes idle, subject to the hourly cap.
 
 `/timeline` is a built-in OpenCode command. Recap deliberately uses `/recap` so the two do not collide.
 
-### Keys
-
-Panel-scoped, only while the panel is focused:
-
-| Key                      | Action                                                                                               |
-| ------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `j` / `down`, `k` / `up` | Move across chapters and visible highlights                                                          |
-| `enter`                  | Expand or collapse a chapter, or open the excerpt for a highlight                                    |
-| `r`                      | Refresh (not during backfill; does not resume a paused backfill or clear a `history-changed` notice) |
-| `b`                      | Build a fresh timeline, resume a paused/backfill-errored document, or rebuild a completed one        |
-| `x`                      | Cancel a backfill                                                                                    |
-| `g` / `G`                | Jump to the first or last row                                                                        |
-
-There is no default global keybind, to avoid conflicts with the host.
+There is no default global keybind, to avoid conflicts with the host. The sidebar is display-only.
 
 ## Privacy
 
@@ -102,7 +90,7 @@ Recap sends a bounded digest to the configured model, not the raw transcript:
 
 ## Compaction limitation
 
-`ctx.session.context` only returns messages after the last compaction. When Recap detects that earlier history is no longer available, it marks coverage as partial and says so in the panel; it seeds the backfill from the compaction summary when one exists. Full recovery of pre-compaction history is future work.
+`ctx.session.context` only returns messages after the last compaction. When Recap detects that earlier history is no longer available, it marks coverage as partial and the sidebar header says `partial`; it seeds the backfill from the compaction summary when one exists. Full recovery of pre-compaction history is future work.
 
 ## Storage
 
@@ -123,10 +111,11 @@ Tested with OpenCode plugin API 2.1.4, OpenTUI 0.6.8, and Bun 1.4.x.
 
 ## Limitations
 
-- Root sessions only; child sessions show a root-only message and make no calls.
+- Root sessions only; child sessions show no sidebar and make no calls.
 - One timeline per session; there is no project-wide or cross-session timeline.
 - No manual chapter editing, reordering, or pinning.
-- No direct scroll-to-message navigation. Highlights open a sanitized excerpt instead.
+- No direct scroll-to-message navigation.
+- Plan staleness is newest-wins: a completed plan disappears when a newer plan is recorded, not when it is finished.
 - Markdown export is not implemented yet; storage is designed so it can be added later.
 
 ## License

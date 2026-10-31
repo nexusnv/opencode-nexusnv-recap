@@ -1,5 +1,5 @@
 import type { Context } from "@opencode/plugin/tui/context"
-import type { TimelineHighlightKind, TimelineStatus } from "../shared/types.js"
+import type { TimelineHighlight, TimelineHighlightKind, TimelineStatus } from "../shared/types.js"
 
 export function relativeTime(iso: string, now = Date.now()): string {
   const value = Date.parse(iso)
@@ -12,35 +12,6 @@ export function relativeTime(iso: string, now = Date.now()): string {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}h ago`
   return `${Math.floor(hours / 24)}d ago`
-}
-
-export function chapterRange(startedAt: string, endedAt: string): string {
-  const start = new Date(startedAt)
-  const end = new Date(endedAt)
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return "unknown"
-  const startTime = `${pad(start.getHours())}:${pad(start.getMinutes())}`
-  const endTime = `${pad(end.getHours())}:${pad(end.getMinutes())}`
-  if (start.toDateString() === end.toDateString()) return `${startTime}–${endTime}`
-  return `${start.toLocaleDateString()} ${startTime}–${end.toLocaleDateString()} ${endTime}`
-}
-
-export function statusLabel(status: TimelineStatus, disabled: boolean, busy: boolean): string {
-  if (disabled) return "DISABLED"
-  if (busy) return "BACKFILLING"
-  switch (status) {
-    case "empty":
-      return "EMPTY"
-    case "backfilling":
-      return "BACKFILLING"
-    case "paused":
-      return "PAUSED"
-    case "ready":
-      return "READY"
-    case "stale":
-      return "STALE"
-    case "error":
-      return "ERROR"
-  }
 }
 
 export function statusColor(context: Context, status: TimelineStatus, disabled: boolean, busy: boolean) {
@@ -88,11 +59,54 @@ export function taskSummary(tasks: {
   return parts.join("   ")
 }
 
-export function artifactSummary(artifacts: Array<{ label: string; state?: string | undefined }>): string {
-  if (artifacts.length === 0) return "None"
-  return artifacts
-    .map((artifact) => (artifact.state ? `${artifact.label} ${artifact.state}` : artifact.label))
-    .join("; ")
+export function compactChapterRange(startedAt: string, endedAt: string): string {
+  const start = new Date(startedAt)
+  const end = new Date(endedAt)
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return "unknown"
+  const startTime = `${pad(start.getHours())}:${pad(start.getMinutes())}`
+  if (start.toDateString() === end.toDateString()) {
+    return `${startTime}–${pad(end.getHours())}:${pad(end.getMinutes())}`
+  }
+  return `${start.getMonth() + 1}/${start.getDate()} ${startTime}`
+}
+
+export function statusWord(status: TimelineStatus, disabled: boolean, busy: boolean): string | undefined {
+  if (disabled) return "disabled"
+  if (busy) return status === "backfilling" ? "building" : "updating"
+  switch (status) {
+    case "ready":
+      return undefined
+    case "empty":
+      return "not built"
+    case "backfilling":
+      return "building"
+    case "paused":
+      return "paused"
+    case "stale":
+      return "stale"
+    case "error":
+      return "error"
+  }
+}
+
+export function kindColor(context: Context, highlight: TimelineHighlight) {
+  switch (highlight.kind) {
+    case "decision":
+    case "issue":
+      return context.theme.text.feedback.warning.base
+    case "implementation":
+    case "pr":
+    case "commit":
+      return context.theme.text.action.primary.base
+    case "task":
+      if (highlight.task?.status === "done") return context.theme.text.feedback.success.base
+      if (highlight.task?.status === "blocked") return context.theme.text.feedback.error.base
+      return context.theme.text.feedback.warning.base
+    case "note":
+      return context.theme.text.muted
+    case "plan":
+      return context.theme.text.feedback.info.base
+  }
 }
 
 function pad(value: number): string {
