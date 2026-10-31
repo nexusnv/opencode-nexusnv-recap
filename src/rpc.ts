@@ -40,7 +40,7 @@ const highlight = {
   type: "object",
   properties: {
     id: { type: "string" },
-    kind: { type: "string", enum: ["decision", "implementation", "task", "pr", "commit", "issue", "note"] },
+    kind: { type: "string", enum: ["decision", "implementation", "task", "pr", "commit", "issue", "note", "plan"] },
     text: { type: "string" },
     at: { type: "string" },
     anchorMessageID: { type: "string" },

@@ -65,7 +65,7 @@ const artifactSchema = z.object({
 })
 
 const highlightSchema = z.object({
-  kind: z.enum(["decision", "implementation", "task", "pr", "commit", "issue", "note"]),
+  kind: z.enum(["decision", "implementation", "task", "pr", "commit", "issue", "note", "plan"]),
   text: z.string().min(1),
   anchor: z.string().min(1),
   artifact: artifactSchema.nullish(),

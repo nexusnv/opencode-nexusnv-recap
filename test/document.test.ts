@@ -102,6 +102,23 @@ describe("timelineDocumentSchema", () => {
     expect(timelineDocumentSchema.safeParse({ ...doc, status: "disabled" }).success).toBe(false)
     expect(timelineDocumentSchema.safeParse({ ...doc, meta: { ...doc.meta, callCount: -1 } }).success).toBe(false)
   })
+
+  test("accepts a plan highlight kind", () => {
+    const doc = createDocument({
+      sessionID: "ses_1",
+      sessionTitle: "Test",
+      model: { providerID: "openai", modelID: "gpt-5-mini" },
+      promptVersion: 1,
+      now: "2026-10-29T10:00:00.000Z",
+    })
+    doc.chapters = [
+      chapter({
+        highlights: [{ ...highlight(), kind: "plan" } as unknown as TimelineHighlight],
+      }),
+    ]
+
+    expect(parseDocument(doc)).toEqual(doc)
+  })
 })
 
 describe("deriveHeader", () => {

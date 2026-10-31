@@ -62,5 +62,7 @@ function label(kind: TimelineHighlight["kind"]): string {
       return "Issue"
     case "note":
       return "Note"
+    case "plan":
+      return "Plan"
   }
 }

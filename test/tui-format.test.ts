@@ -89,8 +89,10 @@ describe("statusColor", () => {
 describe("glyph", () => {
   test("maps every highlight kind", () => {
     expect(
-      (["decision", "implementation", "task", "pr", "commit", "issue", "note"] as const).map((kind) => glyph(kind)),
-    ).toEqual(["◆", "✦", "✓", "⇗", "⌁", "◇", "·"])
+      (["decision", "implementation", "task", "pr", "commit", "issue", "note", "plan"] as const).map((kind) =>
+        glyph(kind),
+      ),
+    ).toEqual(["◆", "✦", "✓", "⇗", "⌁", "◇", "·", "→"])
   })
 })
 

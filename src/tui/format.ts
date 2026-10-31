@@ -68,6 +68,8 @@ export function glyph(kind: TimelineHighlightKind): string {
       return "◇"
     case "note":
       return "·"
+    case "plan":
+      return "→"
   }
 }
 

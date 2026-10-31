@@ -88,6 +88,29 @@ describe("parseModelOutput top-level validation", () => {
     expect(expectOutput(parse(noOp()))).toStrictEqual({ goal: null, tasks: null, chapters: [] })
   })
 
+  test("parses a plan highlight as explicit future intent", () => {
+    const output = expectOutput(
+      parse({
+        goal: "",
+        tasks: null,
+        chapters: [
+          chapter({
+            highlights: [highlight({ kind: "plan", text: "Next: add export", anchor: "m2" })],
+          }),
+        ],
+      }),
+    )
+
+    expect(output.chapters[0]?.highlights).toStrictEqual([
+      {
+        kind: "plan",
+        text: "Next: add export",
+        at: "2026-10-29T10:01:00.000Z",
+        anchorMessageID: "msg_2",
+      },
+    ])
+  })
+
   test("keeps the chapter ID for an extend targeting the current chapter", () => {
     const output = expectOutput(
       parse({

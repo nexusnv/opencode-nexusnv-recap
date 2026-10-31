@@ -14,7 +14,15 @@ export interface TimelineTask {
   updatedAt: string
 }
 
-export type TimelineHighlightKind = "decision" | "implementation" | "task" | "pr" | "commit" | "issue" | "note"
+export type TimelineHighlightKind =
+  | "decision"
+  | "implementation"
+  | "task"
+  | "pr"
+  | "commit"
+  | "issue"
+  | "note"
+  | "plan"
 
 export interface TimelineHighlightArtifact {
   type: "pr" | "commit"

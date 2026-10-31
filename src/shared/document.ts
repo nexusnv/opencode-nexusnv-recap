@@ -3,7 +3,7 @@ import type { TimelineDocument, TimelineHeader, TimelineHighlight, TimelineModel
 
 const statusSchema = z.enum(["empty", "backfilling", "paused", "ready", "stale", "error"])
 const taskStatusSchema = z.enum(["open", "done", "blocked"])
-const kindSchema = z.enum(["decision", "implementation", "task", "pr", "commit", "issue", "note"])
+const kindSchema = z.enum(["decision", "implementation", "task", "pr", "commit", "issue", "note", "plan"])
 const artifactSchema = z.strictObject({
   type: z.enum(["pr", "commit"]),
   url: z.string().optional(),
