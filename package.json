@@ -85,7 +85,7 @@
     "@opentui/solid": "0.6.8",
     "@types/bun": "1.4.4",
     "@types/node": "24.12.2",
-    "oxlint": "1.89.0",
+    "oxlint": "1.90.0",
     "prettier": "3.9.10",
     "solid-js": "1.9.15",
     "typescript": "5.9.3"
