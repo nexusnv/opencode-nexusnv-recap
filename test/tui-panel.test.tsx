@@ -1,9 +1,11 @@
 /** @jsxImportSource @opentui/solid */
 import { describe, expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
+import { createSignal } from "solid-js"
 import { createDocument } from "../src/shared/document"
+import { PANEL_NAME } from "../src/shared/ids"
 import type { TimelineChapter, TimelineDocument, TimelineHighlight, TimelineTask } from "../src/shared/types"
-import { TimelinePanel } from "../src/tui/panel"
+import { TimelinePanel, TimelineSlot } from "../src/tui/panel"
 import { TEST_MODEL } from "./helpers/engine"
 import { fakeTui, panelInput, type FakeRpc } from "./helpers/tui"
 
@@ -46,6 +48,42 @@ function renderPanel(rpc: Partial<FakeRpc>, options: Parameters<typeof fakeTui>[
 }
 
 describe("TimelinePanel", () => {
+  test("reloads when the panel session changes", async () => {
+    const calls: string[] = []
+    const fake = fakeTui({
+      ensure: async (input) => {
+        const sessionID = (input as { sessionID: string }).sessionID
+        calls.push(sessionID)
+        const document = readyDocument()
+        document.sessionID = sessionID
+        document.goal = sessionID === "ses_2" ? "Second session goal" : "First session goal"
+        return { document, busy: false }
+      },
+    })
+    const [sessionID, setSessionID] = createSignal("ses_1")
+    const panel = {
+      ...panelInput({ name: PANEL_NAME }),
+      get sessionID() {
+        return sessionID()
+      },
+    }
+    const app = await testRender(() => <TimelineSlot context={fake.context} panel={panel} />, {
+      width: 100,
+      height: 30,
+    })
+    try {
+      await app.waitForFrame((frame) => frame.includes("First session goal"))
+      expect(calls).toEqual(["ses_1"])
+
+      setSessionID("ses_2")
+      const frame = await app.waitForFrame((value) => value.includes("Second session goal"))
+      expect(frame).toContain("Second session goal")
+      expect(calls).toEqual(["ses_1", "ses_2"])
+    } finally {
+      await app.dispose()
+    }
+  })
+
   test("renders the header, chapter, summary, and newest highlight", async () => {
     const app = await renderPanel({ ensure: async () => ({ document: readyDocument(), busy: false }) })
     try {

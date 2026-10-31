@@ -1132,6 +1132,19 @@ export class TimelineEngine {
           ...(runtime.error ? { error: runtime.error } : {}),
         }
       }
+      // The due check found nothing to process. Record the check so repeated
+      // panel opens do not re-read the whole transcript until the interval
+      // elapses again. A partial (compacted) history change is also a no-op:
+      // the timestamp fallback resumes on the next settled message.
+      if (slice.kind === "empty" || (slice.kind === "history-changed" && read.partial)) {
+        const current = await this.markChecked(sessionID, watermark)
+        return {
+          document: current,
+          busy: this.runtime(sessionID).running !== null,
+          needsBackfill: false,
+          ...(runtime.error ? { error: runtime.error } : {}),
+        }
+      }
     }
     return {
       document,
@@ -1139,6 +1152,25 @@ export class TimelineEngine {
       needsBackfill: false,
       ...(runtime.error ? { error: runtime.error } : {}),
     }
+  }
+
+  /**
+   * Persist a no-op open check. The read already happened, so advancing
+   * `lastCheckedAt` is what makes `openRefreshAfterMinutes` gate the next one.
+   * Re-load under the lock and bail if a real job changed the watermark while
+   * the transcript was being read.
+   */
+  private async markChecked(sessionID: string, watermark: TimelineWatermark): Promise<TimelineDocument | null> {
+    return this.withLock(sessionID, async () => {
+      const latest = await this.deps.store.load(sessionID)
+      this.assertNotDeleted(sessionID)
+      if (!latest) return null
+      if (latest.watermark?.messageID !== watermark.messageID) return latest
+      if (latest.status === "error" || latest.meta.notice?.kind === "history-changed") return latest
+      latest.meta.lastCheckedAt = this.nowIso()
+      await this.persist(sessionID, latest)
+      return latest
+    })
   }
 
   private async autoBackfill(sessionID: string, fallback: TimelineDocument | null): Promise<EnsureResult> {

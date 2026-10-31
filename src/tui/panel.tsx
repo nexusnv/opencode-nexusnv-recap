@@ -3,11 +3,26 @@ import type { ScrollBoxRenderable } from "@opentui/core"
 import type { Context, PanelInput } from "@opencode/plugin/tui/context"
 import { For, Show, createEffect, createMemo, createSignal, on, onMount } from "solid-js"
 import { CONFIG_SNIPPET } from "../config.js"
+import { PANEL_NAME } from "../shared/ids.js"
 import { ChapterRow, HighlightRow } from "./chapter.js"
 import { openExcerpt } from "./excerpt.js"
 import { TimelineHeader } from "./header.js"
 import { createTimelineState, type TimelineState } from "./state.js"
 import { clampSelection, flattenRows, newestChapterID, type TimelineRow } from "./view.js"
+
+/**
+ * The host reuses the `session.panel` claim when `ui.panel.open` targets a
+ * different session. Key the panel by session so its RPC state, event
+ * subscriptions, and selection are recreated instead of staying bound to the
+ * session that happened to be open first.
+ */
+export function TimelineSlot(props: { readonly context: Context; readonly panel: PanelInput }) {
+  return (
+    <Show keyed when={props.panel.name === PANEL_NAME ? props.panel.sessionID : undefined}>
+      {(_sessionID) => <TimelinePanel context={props.context} panel={props.panel} />}
+    </Show>
+  )
+}
 
 export function TimelinePanel(props: { readonly context: Context; readonly panel: PanelInput }) {
   const state = createTimelineState(props.context, props.panel.sessionID)
@@ -180,12 +195,25 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
       props.context.ui.toast.show({ message: "Rebuild required; press b", variant: "warning" })
       return
     }
+    // There is nothing to refresh before the first chunk: `refresh` rejects a
+    // document without a watermark. `ensure` notices new messages and starts
+    // the first build (or returns its estimate) instead.
+    if (value.watermark === null) {
+      await state.load()
+      return
+    }
     await state.refresh()
   }
 
-  function build(): void {
+  async function build(): Promise<void> {
+    if (emptySession()) {
+      // Messages can arrive while the panel stays open, and no event tells the
+      // panel about a first build. `ensure` is the only call that notices and
+      // starts it, so re-check before treating the document as still empty.
+      await state.load()
+      if (emptySession()) return
+    }
     const value = document()
-    if (emptySession()) return
     if (backfilling()) {
       props.context.ui.toast.show({ message: "Backfill in progress", variant: "info" })
       return
@@ -225,7 +253,7 @@ export function TimelinePanel(props: { readonly context: Context; readonly panel
       { bind: "k,up", title: "Previous timeline row", group: "Recap", run: () => move(-1) },
       { bind: "enter", title: "Expand chapter or open excerpt", group: "Recap", run: activate },
       { bind: "r", title: "Refresh timeline", group: "Recap", run: () => void refresh() },
-      { bind: "b", title: "Build, resume, or rebuild timeline", group: "Recap", run: build },
+      { bind: "b", title: "Build, resume, or rebuild timeline", group: "Recap", run: () => void build() },
       { bind: "x", title: "Cancel backfill", group: "Recap", run: cancel },
       { bind: "g", title: "First timeline row", group: "Recap", run: () => setSelected(0) },
       {

@@ -61,6 +61,15 @@ describe("chunkMessages", () => {
     expect(chunks).toHaveLength(2)
     expect(chunks[0]).toEqual([oversized])
     expect(chunks[1]).toEqual([next])
+    expect(buildDigest(chunks[0] ?? [], config()).chars).toBe(config().digest.maxChars)
+  })
+
+  test("caps the digest of a single oversized message at maxChars", () => {
+    const oversized = user("x".repeat(2_500))
+    const digest = buildDigest([oversized], config())
+
+    expect(digest.chars).toBe(config().digest.maxChars)
+    expect(digest.text.length).toBe(config().digest.maxChars)
   })
 
   test("retains a chunk of ignored messages so the watermark can advance", () => {

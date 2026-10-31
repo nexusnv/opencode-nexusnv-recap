@@ -51,6 +51,16 @@ describe("TimelineCommands", () => {
     expect(fake.uiCalls.panelOpen).toHaveLength(0)
   })
 
+  test("opens the panel when it is already open on another session", () => {
+    const { fake, command } = commandFor({
+      currentPanel: panelInput({ name: PANEL_NAME, sessionID: "ses_2" }),
+    })
+    command.run()
+
+    expect(fake.uiCalls.panelClose).toBe(0)
+    expect(fake.uiCalls.panelOpen).toEqual([{ name: PANEL_NAME, options: undefined }])
+  })
+
   test("warns on a non-session route", () => {
     const { fake, command } = commandFor({ route: { type: "home" } })
     command.run()

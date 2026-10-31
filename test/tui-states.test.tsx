@@ -83,8 +83,55 @@ describe("TimelinePanel states", () => {
       await press(fake, "b")
       await drain()
 
-      expect(methods(fake)).toEqual(["ensure"])
+      // `b` re-ensures first so messages that arrived while the panel stayed
+      // open are not missed, but it still does not start a backfill.
+      expect(methods(fake)).toEqual(["ensure", "ensure"])
       expect(fake.uiCalls.toasts).toHaveLength(0)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("r on an empty session re-ensures instead of erroring", async () => {
+    const document = baseDocument()
+    const { fake, app } = await mount({ ensure: async () => ({ document, busy: false }) })
+    try {
+      await app.waitForFrame((frame) => frame.includes("No messages yet."))
+      await press(fake, "r")
+      await drain()
+
+      expect(methods(fake)).toEqual(["ensure", "ensure"])
+      expect(methods(fake)).not.toContain("refresh")
+      const frame = await app.waitForFrame((value) => value.includes("No messages yet."))
+      expect(frame).not.toContain("Build the timeline first.")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("b re-ensures and starts a backfill after messages arrive", async () => {
+    const empty = baseDocument()
+    const buildable = baseDocument()
+    let ensures = 0
+    const { fake, app } = await mount({
+      ensure: async () => {
+        ensures += 1
+        return ensures === 1
+          ? { document: empty, busy: false }
+          : { document: buildable, busy: false, needsBackfill: true, estimate: ESTIMATE }
+      },
+      backfill: async () => ({ started: true, estimate: ESTIMATE }),
+    })
+    try {
+      await app.waitForFrame((frame) => frame.includes("No messages yet."))
+      await press(fake, "b")
+      await drain()
+
+      expect(ensures).toBeGreaterThanOrEqual(2)
+      expect(fake.calls.find((call) => call.method === "backfill")?.input).toEqual({
+        sessionID: "ses_1",
+        confirm: false,
+      })
     } finally {
       await app.dispose()
     }

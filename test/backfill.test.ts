@@ -56,6 +56,10 @@ function longUser(created: number, label: string): UserMessage {
   return user(created, `${label} ${"x".repeat(200)}`)
 }
 
+function oversizedUser(created: number, label: string): UserMessage {
+  return user(created, `${label} ${"x".repeat(2_500)}`)
+}
+
 function watermarkOf(message: SessionMessageInfo, messageCount = 1): TimelineWatermark {
   return {
     messageID: message.id,
@@ -202,9 +206,9 @@ describe("TimelineEngine backfill", () => {
   })
 
   test("a chunk failure keeps earlier chunks and resumes from the watermark", async () => {
-    const first = longUser(BASE_TIME, "alpha")
-    const second = longUser(BASE_TIME + 1_000, "beta")
-    const third = longUser(BASE_TIME + 2_000, "gamma")
+    const first = oversizedUser(BASE_TIME, "alpha")
+    const second = oversizedUser(BASE_TIME + 1_000, "beta")
+    const third = oversizedUser(BASE_TIME + 2_000, "gamma")
     const h = createTestEngine({
       messages: [first, second, third],
       outputs: [
@@ -212,7 +216,7 @@ describe("TimelineEngine backfill", () => {
         chapterOutput("m1", "Second chunk"),
         chapterOutput("m1", "Third chunk"),
       ],
-      config: { digest: { maxChars: 100 } },
+      config: { digest: { maxChars: 2_000 } },
     })
     await h.engine.start()
     h.modelState.errors = [undefined, new ModelFailure("provider unavailable", "transient", true)]
@@ -967,6 +971,35 @@ describe("TimelineEngine backfill concurrency and lifecycle hardening", () => {
     expect(stored.status).toBe("ready")
     expect(stored.watermark?.messageID).toBe(fresh.id)
     expect(h.modelCalls).toHaveLength(1)
+    await h.engine.stop()
+  })
+
+  test("ensure records a no-op open check so repeated opens do not re-read", async () => {
+    const old = user(BASE_TIME - 120_000, "old")
+    const document = makeDocument({
+      watermark: watermarkOf(old),
+      status: "ready",
+      now: "2026-10-29T09:00:00.000Z",
+    })
+    document.meta.lastCheckedAt = "2026-10-29T09:00:00.000Z"
+    let reads = 0
+    const h = createTestEngine({
+      messages: [old],
+      document,
+      beforeContext: () => {
+        reads += 1
+      },
+    })
+    await h.engine.start()
+
+    const first = await h.engine.ensure(TEST_SESSION_ID)
+    expect(first.busy).toBe(false)
+    expect(reads).toBe(1)
+    const checked = await storedDocument(h)
+    expect(checked.meta.lastCheckedAt).toBe(new Date(h.clock.now()).toISOString())
+
+    await h.engine.ensure(TEST_SESSION_ID)
+    expect(reads).toBe(1)
     await h.engine.stop()
   })
 

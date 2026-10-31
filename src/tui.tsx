@@ -1,12 +1,11 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui"
-import { Show } from "solid-js"
-import { PANEL_NAME, TUI_PLUGIN_ID } from "./shared/ids.js"
+import { TUI_PLUGIN_ID } from "./shared/ids.js"
 import { TimelineCommands } from "./tui/commands.js"
-import { TimelinePanel } from "./tui/panel.js"
+import { TimelineSlot } from "./tui/panel.js"
 
 export { TUI_PLUGIN_ID } from "./shared/ids.js"
-export { TimelinePanel } from "./tui/panel.js"
+export { TimelinePanel, TimelineSlot } from "./tui/panel.js"
 export { TimelineCommands } from "./tui/commands.js"
 
 export default Plugin.define({
@@ -14,11 +13,7 @@ export default Plugin.define({
   setup(context) {
     context.ui.slot({
       append: "session.panel",
-      render: (panel) => (
-        <Show when={panel.name === PANEL_NAME}>
-          <TimelinePanel context={context} panel={panel} />
-        </Show>
-      ),
+      render: (panel) => <TimelineSlot context={context} panel={panel} />,
     })
     context.ui.slot({
       append: "app",
