@@ -20,6 +20,7 @@ export function MarqueeLine(props: {
   let text: TextRenderable | undefined
   const [viewport, setViewport] = createSignal(0)
   const [elapsed, setElapsed] = createSignal(0)
+  const [hovered, setHovered] = createSignal(false)
   let startedAt = Date.now()
 
   // Highlights come from a model and may contain newlines. A marquee is a
@@ -54,6 +55,15 @@ export function MarqueeLine(props: {
       },
     ),
   )
+  // Scrolling is driven by the mouse: hovering starts the marquee from the
+  // beginning, leaving the mouse out holds it at the start of the line.
+  createEffect(() => {
+    if (hovered()) {
+      startedAt = Date.now()
+      setElapsed(0)
+    }
+  })
+
   createEffect(() => {
     const value = offset()
     if (text) text.scrollX = value
@@ -71,6 +81,11 @@ export function MarqueeLine(props: {
     measure()
     timer = setInterval(() => {
       measure()
+      if (!hovered()) {
+        // Hold at the start of the line when the mouse is not over the line.
+        setElapsed(0)
+        return
+      }
       if (!metrics().overflow) return
       setElapsed(Date.now() - startedAt)
     }, TICK_MS)
@@ -80,7 +95,13 @@ export function MarqueeLine(props: {
   })
 
   return (
-    <box flexDirection="row" width="100%" flexShrink={0}>
+    <box
+      flexDirection="row"
+      width="100%"
+      flexShrink={0}
+      onMouseOver={() => setHovered(true)}
+      onMouseOut={() => setHovered(false)}
+    >
       <text flexShrink={0} wrapMode="none" fg={props.prefixColor}>
         {props.prefix}{" "}
       </text>

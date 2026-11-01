@@ -297,7 +297,7 @@ describe("RecapSidebar", () => {
     }
   })
 
-  test("scrolls an overflowing ticker instead of truncating it", async () => {
+  test("holds an overflowing ticker at its start until hovered", async () => {
     const document = readyDocument()
     document.chapters[0] = chapter("c1", "A very long chapter title that cannot fit in the sidebar at all", [
       highlight("h1", "First"),
@@ -305,6 +305,27 @@ describe("RecapSidebar", () => {
     const { app } = await mount({ get: async () => ({ document, busy: false }) })
     try {
       const before = await app.waitForFrame((value) => value.includes("A very long chapter"))
+      await Bun.sleep(500)
+      await app.renderOnce()
+      const after = app.captureCharFrame()
+
+      expect(before).toContain("A very long chapter")
+      expect(after).toContain("A very long chapter")
+      expect(after).not.toContain("…")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("scrolls an overflowing ticker while hovered instead of truncating it", async () => {
+    const document = readyDocument()
+    document.chapters[0] = chapter("c1", "A very long chapter title that cannot fit in the sidebar at all", [
+      highlight("h1", "First"),
+    ])
+    const { app } = await mount({ get: async () => ({ document, busy: false }) })
+    try {
+      const before = await app.waitForFrame((value) => value.includes("A very long chapter"))
+      await app.mockMouse.moveTo(10, 1)
       await Bun.sleep(500)
       await app.renderOnce()
       const after = app.captureCharFrame()
